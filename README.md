@@ -24,7 +24,7 @@ Default options-flow provider:
 
 ```env
 OPTIONS_PROVIDER=polygon
-POLYGON_API_KEY=your_polygon_key
+POLYGON_API_KEY=lFKvsbqX5ZNGA2JephgNr4Z_OTqNHsYh
 ```
 
 Optional alternatives:
