@@ -41,7 +41,7 @@ LIVE_FEEDS: Dict[str, FeedConfig] = {
     "news_rss": FeedConfig("news_rss", "News RSS", "news", []),
     "stooq_market": FeedConfig("stooq_market", "Stooq Market Pulse", "market_data", []),
     "binance_crypto": FeedConfig("binance_crypto", "Binance Crypto Pulse", "crypto_market_data", []),
-    "options_flow": FeedConfig("options_flow", "Options Flow", "options", ["TRADIER_TOKEN or POLYGON_API_KEY"]),
+    "options_flow": FeedConfig("options_flow", "Options Flow", "options", ["POLYGON_API_KEY or MARKETDATA_API_TOKEN or TRADIER_TOKEN"]),
 }
 
 class LiveFeedCollector:
@@ -239,13 +239,29 @@ class LiveFeedCollector:
         return out[:max_per_feed]
 
     def collect_options_flow(self, max_per_feed: int = 25) -> List[Signal]:
-        tradier = os.getenv("TRADIER_TOKEN")
-        if tradier:
-            return self._collect_tradier_options(max_per_feed)
-        polygon = os.getenv("POLYGON_API_KEY")
-        if polygon:
-            return self._collect_polygon_options(max_per_feed)
-        raise MissingCredential("Set TRADIER_TOKEN or POLYGON_API_KEY to enable live options flow")
+        provider = os.getenv("OPTIONS_PROVIDER", "polygon").strip().lower()
+        providers = [provider] + [p for p in ["polygon", "marketdata", "tradier"] if p != provider]
+        errors = []
+        for p in providers:
+            try:
+                if p == "polygon" and os.getenv("POLYGON_API_KEY"):
+                    rows = self._collect_polygon_options(max_per_feed)
+                    if rows:
+                        return rows
+                    errors.append("Polygon returned no qualifying options-flow rows")
+                elif p == "marketdata" and os.getenv("MARKETDATA_API_TOKEN"):
+                    rows = self._collect_marketdata_options(max_per_feed)
+                    if rows:
+                        return rows
+                    errors.append("MarketData.app returned no qualifying options-flow rows")
+                elif p == "tradier" and os.getenv("TRADIER_TOKEN"):
+                    rows = self._collect_tradier_options(max_per_feed)
+                    if rows:
+                        return rows
+                    errors.append("Tradier returned no qualifying options-flow rows")
+            except Exception as exc:
+                errors.append(f"{p}: {exc}")
+        raise MissingCredential("Set POLYGON_API_KEY, MARKETDATA_API_TOKEN, or TRADIER_TOKEN to enable live options flow. " + "; ".join(errors[-3:]))
 
     def _collect_tradier_options(self, max_per_feed: int) -> List[Signal]:
         token = os.environ["TRADIER_TOKEN"]
@@ -283,6 +299,31 @@ class LiveFeedCollector:
                     return out
         return out
 
+    def _collect_marketdata_options(self, max_per_feed: int) -> List[Signal]:
+        token = os.environ["MARKETDATA_API_TOKEN"]
+        underlyings = os.getenv("OPTIONS_UNDERLYINGS", "SPY,QQQ,NVDA,TSLA,XLE,USO,GLD,SLV,VRT,ETN").split(",")
+        out: List[Signal] = []
+        for sym in [s.strip().upper() for s in underlyings if s.strip()]:
+            data = self._get_json(f"https://api.marketdata.app/v1/options/chain/{sym}/", {"token": token})
+            rows = normalize_marketdata_chain(data)
+            scored = []
+            for opt in rows:
+                vol = as_float(opt.get("volume")); oi = max(1.0, as_float(opt.get("openInterest") or opt.get("open_interest")))
+                if vol <= 0:
+                    continue
+                scored.append((vol/oi, vol, opt))
+            for ratio, vol, opt in sorted(scored, reverse=True)[:2]:
+                right = str(opt.get("side") or opt.get("type") or opt.get("optionType") or "call").lower()
+                direction = "BUY" if right.startswith("c") else "SELL"
+                strike = opt.get("strike") or opt.get("strikePrice")
+                expiration = opt.get("expiration") or opt.get("expirationDate")
+                title = f"{sym} unusual {right} activity"
+                desc = f"Live MarketData.app option chain: {right} {strike} exp {expiration}; volume {vol:,.0f}; volume/open-interest {ratio:.2f}."
+                out.append(self._signal("MarketData.app Options Flow", sym, direction, min(.88, .50 + min(.30, ratio/8) + min(.08, vol/5000)), title, desc, min(100, ratio*10), {"feed_key":"options_flow", "feed_type":"options", "option_type":right, "strike":strike, "expiration":expiration, "volume":vol, "open_interest":opt.get("openInterest") or opt.get("open_interest"), "volume_oi_ratio":ratio, "volume_zscore":min(8, max(1, ratio))}))
+                if len(out) >= max_per_feed:
+                    return out
+        return out
+
     def _collect_polygon_options(self, max_per_feed: int) -> List[Signal]:
         key = os.environ["POLYGON_API_KEY"]
         underlyings = os.getenv("OPTIONS_UNDERLYINGS", "SPY,QQQ,NVDA,TSLA,XLE,USO,GLD,SLV,VRT,ETN").split(",")
@@ -307,6 +348,27 @@ class LiveFeedCollector:
                 if len(out) >= max_per_feed:
                     return out
         return out
+
+def normalize_marketdata_chain(data: Any) -> List[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+    # MarketData.app commonly returns column arrays. Convert either array-of-objects or columnar payloads.
+    if isinstance(data.get("results"), list):
+        return [x for x in data.get("results", []) if isinstance(x, dict)]
+    columns = ["optionSymbol", "expiration", "strike", "side", "bid", "ask", "last", "volume", "openInterest"]
+    lengths = [len(data.get(c, [])) for c in columns if isinstance(data.get(c), list)]
+    if not lengths:
+        return []
+    n = max(lengths)
+    rows: List[Dict[str, Any]] = []
+    for i in range(n):
+        row: Dict[str, Any] = {}
+        for c in columns:
+            values = data.get(c)
+            if isinstance(values, list) and i < len(values):
+                row[c] = values[i]
+        rows.append(row)
+    return rows
 
 class MissingCredential(Exception):
     pass

@@ -1,4 +1,6 @@
 from __future__ import annotations
+from app.config import load_env_file
+load_env_file()
 import argparse
 import time
 from app.platform import TradingPlatform
