@@ -18,6 +18,13 @@ FEED_TYPE_FALLBACKS: Dict[str, List[str]] = {
     "filings": ["sec_filings"],
     "positioning": ["cftc_cot"],
     "options": ["options_flow"],
+    "macro_data": ["fred_macro"],
+    "rates": ["treasury_rates"],
+    "energy_data": ["eia_energy"],
+    "weather": ["noaa_alerts"],
+    "power_grid": ["grid_power"],
+    "supply_chain": ["shipping_events"],
+    "canada_macro": ["bank_of_canada"],
 }
 
 @dataclass
@@ -55,6 +62,14 @@ def feed_key_from_health_name(feed_name: str) -> str:
         "binance_crypto_pulse": "binance_crypto",
         "crypto_market_pulse": "crypto_market",
         "options_flow": "options_flow",
+        "gdelt_global_events": "gdelt_events",
+        "fred_macro_pulse": "fred_macro",
+        "treasury_yield_pulse": "treasury_rates",
+        "eia_energy_pulse": "eia_energy",
+        "noaa_weather/drought_alerts": "noaa_alerts",
+        "power_grid_pulse": "grid_power",
+        "shipping/supply_chain_events": "shipping_events",
+        "bank_of_canada_macro": "bank_of_canada",
     }
     return aliases.get(normalized, normalized)
 

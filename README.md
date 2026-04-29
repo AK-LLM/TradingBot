@@ -71,3 +71,20 @@ The system looks for confirmation across feed categories, not just individual pr
 - Filings/positioning: SEC and CFTC
 
 Action advice remains: **Strong Buy, Buy, Hold, Sell, Strong Sell**.
+
+## V5.4 macro/event intelligence expansion
+
+This build adds location-neutral public collectors. They are wired as live collectors and do not require brokerage access.
+
+| Feed | Category | Purpose |
+|---|---|---|
+| GDELT Global Events | News/event | Global event pressure: geopolitics, sanctions, energy, drought, grid, shipping. |
+| FRED Macro Pulse | Macro data | Rates, dollar, credit, inflation/liquidity backdrop. |
+| Treasury Yield Pulse | Rates | Yield-curve and bond-market stress/relief. |
+| EIA Energy Pulse | Energy data/news | Oil, natural gas, electricity, inventories, power demand headlines. |
+| NOAA Weather/Drought Alerts | Weather | Heat, storm, drought/flood stress for energy, water, grid and cooling themes. |
+| Power Grid Pulse | Power grid | Electricity/grid demand and reliability news. |
+| Shipping/Supply Chain Events | Supply chain | Shipping, tanker, port, canal and supply-chain disruption signals. |
+| Bank of Canada Macro | Canada macro | Canada-relevant FX/rate/macro observations via public Valet data. |
+
+These feeds strengthen confirmation without changing the core rule: **2 confirmations from different feed categories + sanity checks before action advice.**

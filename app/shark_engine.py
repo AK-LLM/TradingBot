@@ -102,8 +102,8 @@ class SharkEngine:
             passed = False
         if freshness < float(settings.get("min_freshness_score", 55)):
             passed = False
-        market_or_options = any((r.metadata.get("feed_type") in {"market_data", "crypto_market_data", "options", "positioning"}) for r in rows)
-        event_feed = any((r.metadata.get("feed_type") in {"news", "prediction_market", "forecasting", "filings"}) for r in rows)
+        market_or_options = any((r.metadata.get("feed_type") in {"market_data", "crypto_market_data", "options", "positioning", "macro_data", "rates", "energy_data", "power_grid", "canada_macro"}) for r in rows)
+        event_feed = any((r.metadata.get("feed_type") in {"news", "prediction_market", "forecasting", "filings", "weather", "supply_chain", "energy_data", "power_grid"}) for r in rows)
         if not market_or_options:
             warnings.append("No market/options/positioning confirmation yet")
             passed = False

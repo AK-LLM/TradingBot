@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 import os, json, math, re, csv, io, xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 import requests
 from app.models import Signal, new_id, now_iso
 from app.instrument_map import classify_narrative
@@ -42,6 +43,14 @@ LIVE_FEEDS: Dict[str, FeedConfig] = {
     "stooq_market": FeedConfig("stooq_market", "Stooq Market Pulse", "market_data", []),
     "crypto_market": FeedConfig("crypto_market", "Crypto Market Pulse", "crypto_market_data", []),
     "options_flow": FeedConfig("options_flow", "Options Flow", "options", ["POLYGON_API_KEY or MARKETDATA_API_TOKEN or TRADIER_TOKEN"]),
+    "gdelt_events": FeedConfig("gdelt_events", "GDELT Global Events", "news", []),
+    "fred_macro": FeedConfig("fred_macro", "FRED Macro Pulse", "macro_data", []),
+    "treasury_rates": FeedConfig("treasury_rates", "Treasury Yield Pulse", "rates", []),
+    "eia_energy": FeedConfig("eia_energy", "EIA Energy Pulse", "energy_data", []),
+    "noaa_alerts": FeedConfig("noaa_alerts", "NOAA Weather/Drought Alerts", "weather", []),
+    "grid_power": FeedConfig("grid_power", "Power Grid Pulse", "power_grid", []),
+    "shipping_events": FeedConfig("shipping_events", "Shipping/Supply Chain Events", "supply_chain", []),
+    "bank_of_canada": FeedConfig("bank_of_canada", "Bank of Canada Macro", "canada_macro", []),
 }
 
 class FeedAccessLimited(Exception):
@@ -73,6 +82,14 @@ class LiveFeedCollector:
             "crypto_market": self.collect_crypto_market,
             "binance_crypto": self.collect_crypto_market,
             "options_flow": self.collect_options_flow,
+            "gdelt_events": self.collect_gdelt_events,
+            "fred_macro": self.collect_fred_macro,
+            "treasury_rates": self.collect_treasury_rates,
+            "eia_energy": self.collect_eia_energy,
+            "noaa_alerts": self.collect_noaa_alerts,
+            "grid_power": self.collect_grid_power,
+            "shipping_events": self.collect_shipping_events,
+            "bank_of_canada": self.collect_bank_of_canada,
         }
         for key in keys:
             cfg = LIVE_FEEDS.get(key)
@@ -331,6 +348,127 @@ class LiveFeedCollector:
             out.append(self._signal("Crypto Market Pulse", sym, "BUY" if chg >= 0 else "SELL", min(.85, .48+abs(chg)/30), f"{sym} crypto liquidity move {chg:+.2f}%", f"Live CoinGecko ticker. Last {price}; 24h volume {vol:,.0f}.", abs(chg), {"feed_key":"crypto_market", "feed_type":"crypto_market_data", "provider":"coingecko", "volume":vol, "price":price, "probability_change_pct":abs(chg), "volume_zscore":volume_score(vol)}))
         return out[:max_per_feed]
 
+    def collect_gdelt_events(self, max_per_feed: int = 25) -> List[Signal]:
+        query = os.getenv("GDELT_QUERY", "(oil OR energy OR sanctions OR war OR conflict OR drought OR datacenter OR data center OR power grid OR nuclear OR shipping OR tanker OR semiconductor OR rates OR inflation)")
+        data = self._get_json("https://api.gdeltproject.org/api/v2/doc/doc", {"query": query, "mode":"ArtList", "format":"json", "maxrecords":min(max_per_feed, 50), "sort":"hybridrel"})
+        articles = data.get("articles", []) if isinstance(data, dict) else []
+        out: List[Signal] = []
+        for a in articles[:max_per_feed]:
+            title = clean_html(a.get("title") or "GDELT global event")
+            desc = clean_html((a.get("seendate") or "") + " " + (a.get("sourceCountry") or "") + " " + (a.get("domain") or ""))
+            text = f"{title} {desc}"
+            narr = classify_narrative(text)
+            out.append(self._signal("GDELT Global Events", infer_symbol(text), narrative_direction(narr), .54, title, desc, 5.0, {"feed_key":"gdelt_events", "feed_type":"news", "narrative":narr, "url":a.get("url"), "domain":a.get("domain"), "country":a.get("sourceCountry"), "volume_zscore":1.6}))
+        return out
+
+    def collect_fred_macro(self, max_per_feed: int = 25) -> List[Signal]:
+        series = [x.strip().upper() for x in os.getenv("FRED_SERIES", "DGS10,DGS2,T10Y2Y,DFF,DTWEXBGS,DEXUSEU,DEXCAUS,BAMLH0A0HYM2").split(",") if x.strip()]
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=" + ",".join(series)
+        r = self.session.get(url, timeout=TIMEOUT, headers={"User-Agent": UA})
+        r.raise_for_status()
+        rows = list(csv.DictReader(io.StringIO(r.text)))
+        if len(rows) < 2: return []
+        latest, prev = rows[-1], rows[-2]
+        out: List[Signal] = []
+        for sid in series[:max_per_feed]:
+            cur = as_float(latest.get(sid), None); old = as_float(prev.get(sid), None)
+            if cur is None or old is None or latest.get(sid) in {".", ""} or prev.get(sid) in {".", ""}: continue
+            delta = cur - old
+            narr = "rate_cuts" if sid in {"DGS10", "DGS2", "T10Y2Y", "DFF"} else "market_stress"
+            direction = "BUY" if (sid in {"T10Y2Y", "DFF"} and delta < 0) or (sid == "BAMLH0A0HYM2" and delta < 0) else "SELL" if abs(delta) > 0 else "WATCH"
+            out.append(self._signal("FRED Macro Pulse", "TLT" if narr=="rate_cuts" else "SPY", direction, min(.80, .50 + min(.25, abs(delta)/2)), f"{sid} macro move {delta:+.3f}", f"FRED latest {latest.get('observation_date')}: {sid}={cur}; prior={old}.", abs(delta)*10, {"feed_key":"fred_macro", "feed_type":"macro_data", "series":sid, "current":cur, "previous":old, "delta":delta, "narrative":narr, "volume_zscore":1.2}))
+        return out
+
+    def collect_treasury_rates(self, max_per_feed: int = 25) -> List[Signal]:
+        now = datetime.now(timezone.utc)
+        months = [(now.year, now.month), (now.year if now.month > 1 else now.year-1, now.month-1 if now.month > 1 else 12)]
+        root = None
+        for y, m in months:
+            url = f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value_month={y}{m:02d}"
+            r = self.session.get(url, timeout=TIMEOUT, headers={"User-Agent": UA, "Accept":"application/xml,text/xml,*/*"})
+            if r.status_code == 200 and r.content:
+                root = ET.fromstring(r.content); break
+        if root is None: return []
+        entries = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+        if not entries: return []
+        text = ET.tostring(entries[-1], encoding="unicode")
+        vals = {name: extract_xml_float(text, name) for name in ["BC_2YEAR", "BC_10YEAR", "BC_30YEAR", "BC_3MONTH"]}
+        out: List[Signal] = []
+        if vals.get("BC_10YEAR") is not None and vals.get("BC_2YEAR") is not None:
+            spread = vals["BC_10YEAR"] - vals["BC_2YEAR"]
+            direction = "BUY" if spread > -0.25 else "SELL"
+            out.append(self._signal("Treasury Yield Pulse", "TLT", direction, .58 + min(.18, abs(spread)/3), f"2Y/10Y yield spread {spread:+.2f}", f"Latest Treasury curve: 2Y={vals['BC_2YEAR']}, 10Y={vals['BC_10YEAR']}, 30Y={vals.get('BC_30YEAR')}.", abs(spread)*10, {"feed_key":"treasury_rates", "feed_type":"rates", "narrative":"rate_cuts", "spread_2s10s":spread, "volume_zscore":1.3}))
+        return out[:max_per_feed]
+
+    def collect_eia_energy(self, max_per_feed: int = 25) -> List[Signal]:
+        return self._collect_rss_bundle("EIA Energy Pulse", "eia_energy", "energy_data", energy_feed_urls(), max_per_feed, default_narrative="energy_infrastructure")
+
+    def collect_grid_power(self, max_per_feed: int = 25) -> List[Signal]:
+        return self._collect_rss_bundle("Power Grid Pulse", "grid_power", "power_grid", grid_feed_urls(), max_per_feed, default_narrative="energy_infrastructure")
+
+    def _collect_rss_bundle(self, source: str, feed_key: str, feed_type: str, feeds: List[str], max_per_feed: int, default_narrative: str) -> List[Signal]:
+        out: List[Signal] = []; errors: List[str] = []
+        per = max(1, math.ceil(max_per_feed / max(1, len(feeds))))
+        for url in feeds:
+            try:
+                r = self.session.get(url, timeout=TIMEOUT, headers={"User-Agent": UA, "Accept":"application/rss+xml,application/xml,text/xml,*/*"})
+                r.raise_for_status(); root = ET.fromstring(r.content)
+                items = root.findall(".//item") or root.findall(".//{http://www.w3.org/2005/Atom}entry")
+                for item in items[:per]:
+                    title = clean_html(find_text(item, ["title", "{http://www.w3.org/2005/Atom}title"]) or source)
+                    desc = clean_html(find_text(item, ["description", "summary", "{http://www.w3.org/2005/Atom}summary"]) or "")[:500]
+                    text = f"{title} {desc}"
+                    narr = classify_narrative(text)
+                    if narr == "single_name": narr = default_narrative
+                    out.append(self._signal(source, infer_symbol(text), narrative_direction(narr), .55, title, desc, 5.0, {"feed_key":feed_key, "feed_type":feed_type, "narrative":narr, "source_url":url, "volume_zscore":1.5}))
+                    if len(out) >= max_per_feed: return out
+            except Exception as exc:
+                errors.append(f"{url}: {type(exc).__name__} {str(exc)[:80]}"); continue
+        if out: return out
+        raise RuntimeError(f"All {source} public feeds failed. " + " | ".join(errors[:4]))
+
+    def collect_noaa_alerts(self, max_per_feed: int = 25) -> List[Signal]:
+        data = self._get_json("https://api.weather.gov/alerts/active", {"status":"actual", "message_type":"alert", "limit":min(max_per_feed, 50)}, {"User-Agent": UA, "Accept":"application/geo+json,application/json"})
+        features = data.get("features", []) if isinstance(data, dict) else []
+        out: List[Signal] = []
+        for f in features[:max_per_feed]:
+            props = f.get("properties", {}) if isinstance(f, dict) else {}
+            title = props.get("headline") or props.get("event") or "NOAA alert"
+            severity = str(props.get("severity") or "").lower(); area = props.get("areaDesc") or ""
+            text = f"{title} {area} {props.get('description','')}"
+            narr = "energy_infrastructure" if any(x in text.lower() for x in ["heat", "winter", "storm", "hurricane", "fire"]) else "water_infrastructure" if any(x in text.lower() for x in ["drought", "flood"]) else classify_narrative(text)
+            conf = .54 + (.12 if severity in {"severe", "extreme"} else .04)
+            out.append(self._signal("NOAA Weather/Drought Alerts", infer_symbol(text), narrative_direction(narr), conf, title, area, 6.0 if severity in {"severe","extreme"} else 3.0, {"feed_key":"noaa_alerts", "feed_type":"weather", "narrative":narr, "severity":severity, "volume_zscore":1.4}))
+        return out
+
+    def collect_shipping_events(self, max_per_feed: int = 25) -> List[Signal]:
+        query = os.getenv("SHIPPING_GDELT_QUERY", "(shipping OR tanker OR freight OR port congestion OR Red Sea OR Suez OR Panama Canal OR supply chain OR container) (oil OR energy OR trade OR disruption)")
+        data = self._get_json("https://api.gdeltproject.org/api/v2/doc/doc", {"query":query, "mode":"ArtList", "format":"json", "maxrecords":min(max_per_feed, 50), "sort":"hybridrel"})
+        articles = data.get("articles", []) if isinstance(data, dict) else []
+        out: List[Signal] = []
+        for a in articles[:max_per_feed]:
+            title = clean_html(a.get("title") or "Shipping event")
+            desc = clean_html((a.get("sourceCountry") or "") + " " + (a.get("domain") or ""))
+            text = f"{title} {desc}"
+            narr = "oil_geopolitics" if any(x in text.lower() for x in ["tanker", "oil", "red sea", "suez"]) else "market_stress"
+            out.append(self._signal("Shipping/Supply Chain Events", infer_symbol(text), narrative_direction(narr), .54, title, desc, 5.0, {"feed_key":"shipping_events", "feed_type":"supply_chain", "narrative":narr, "url":a.get("url"), "domain":a.get("domain"), "volume_zscore":1.5}))
+        return out
+
+    def collect_bank_of_canada(self, max_per_feed: int = 25) -> List[Signal]:
+        series = [x.strip().upper() for x in os.getenv("BOC_SERIES", "FXUSDCAD,V39079,V39065,V39063").split(",") if x.strip()]
+        data = self._get_json("https://www.bankofcanada.ca/valet/observations/" + ",".join(series) + "/json", {"recent":5})
+        obs = data.get("observations", []) if isinstance(data, dict) else []
+        if len(obs) < 2: return []
+        latest, prev = obs[-1], obs[-2]
+        out: List[Signal] = []
+        for sid in series[:max_per_feed]:
+            cur = as_float((latest.get(sid) or {}).get("v"), None); old = as_float((prev.get(sid) or {}).get("v"), None)
+            if cur is None or old is None: continue
+            delta = cur - old; sym = "CAD" if sid.startswith("FX") else "TLT"
+            direction = "BUY" if delta > 0 and sid.startswith("FX") else "SELL" if abs(delta) > 0 else "WATCH"
+            out.append(self._signal("Bank of Canada Macro", sym, direction, min(.80, .50+min(.22, abs(delta)/2)), f"{sid} Canada macro move {delta:+.4f}", f"Bank of Canada Valet latest {latest.get('d')}: {sid}={cur}; prior={old}.", abs(delta)*10, {"feed_key":"bank_of_canada", "feed_type":"canada_macro", "series":sid, "current":cur, "previous":old, "delta":delta, "narrative":"rate_cuts", "volume_zscore":1.2}))
+        return out
+
     def collect_options_flow(self, max_per_feed: int = 25) -> List[Signal]:
         provider = os.getenv("OPTIONS_PROVIDER", "polygon").strip().lower()
         providers = [provider] + [p for p in ["polygon", "marketdata", "tradier"] if p != provider]
@@ -514,6 +652,21 @@ def infer_symbol(text: str) -> str:
 
 def narrative_direction(narr: str) -> str:
     return {"oil_geopolitics":"BUY", "rate_cuts":"BUY", "ai_policy":"SELL", "crypto_regulation":"BUY", "taiwan_risk":"SELL", "market_stress":"SELL", "precious_metals":"BUY", "energy_infrastructure":"BUY", "water_infrastructure":"BUY", "data_center_infrastructure":"BUY"}.get(narr, "WATCH")
+
+def extract_xml_float(text: str, tag: str) -> Optional[float]:
+    m = re.search(rf"<(?:[^:<>]+:)?{tag}[^>]*>([^<]+)</(?:[^:<>]+:)?{tag}>", text)
+    if not m: return None
+    return as_float(m.group(1), None)
+
+def energy_feed_urls() -> List[str]:
+    raw = os.getenv("EIA_RSS_URLS") or os.getenv("ENERGY_RSS_URLS")
+    if raw: return [x.strip() for x in raw.split(",") if x.strip()]
+    return ["https://www.eia.gov/rss/todayinenergy.xml", "https://www.eia.gov/rss/petroleum.xml", "https://www.eia.gov/rss/naturalgas.xml", "https://www.eia.gov/rss/electricity.xml"]
+
+def grid_feed_urls() -> List[str]:
+    raw = os.getenv("GRID_RSS_URLS")
+    if raw: return [x.strip() for x in raw.split(",") if x.strip()]
+    return ["https://www.eia.gov/rss/electricity.xml", "https://www.ercot.com/news/rss", "https://www.caiso.com/Documents/RSSFeed.xml"]
 
 def news_feed_urls() -> List[str]:
     raw = os.getenv("NEWS_RSS_URLS")
