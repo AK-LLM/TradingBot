@@ -4,15 +4,17 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Set
 
 LIVE_STATUSES = {"live"}
-DEGRADED_STATUSES = {"empty"}
-BLOCKING_STATUSES = {"error", "auth_required", "disabled"}
+# These statuses are visible in Feed Health but are not treated as hard failures.
+# They should not poison readiness when the suite has enough other live categories.
+DEGRADED_STATUSES = {"empty", "credential_pending", "access_limited", "geo_blocked", "not_supported"}
+BLOCKING_STATUSES = {"error"}
 
 FEED_TYPE_FALLBACKS: Dict[str, List[str]] = {
     "prediction_market": ["polymarket", "kalshi", "predictit", "manifold"],
     "forecasting": ["metaculus"],
     "news": ["news_rss"],
     "market_data": ["stooq_market"],
-    "crypto_market_data": ["binance_crypto"],
+    "crypto_market_data": ["crypto_market", "binance_crypto"],
     "filings": ["sec_filings"],
     "positioning": ["cftc_cot"],
     "options": ["options_flow"],
@@ -51,6 +53,7 @@ def feed_key_from_health_name(feed_name: str) -> str:
         "news_rss": "news_rss",
         "stooq_market_pulse": "stooq_market",
         "binance_crypto_pulse": "binance_crypto",
+        "crypto_market_pulse": "crypto_market",
         "options_flow": "options_flow",
     }
     return aliases.get(normalized, normalized)
@@ -89,7 +92,10 @@ class FeedReliabilityEngine:
         if len(active_types) < required_types:
             messages.append(f"Only {len(active_types)} live feed types available; minimum is {required_types}.")
         if failed:
-            messages.append(f"{len(failed)} feed(s) require attention.")
+            messages.append(f"{len(failed)} feed(s) failed with runtime errors.")
+        non_live = [h for h in health if h.get("status") in DEGRADED_STATUSES]
+        if non_live:
+            messages.append(f"{len(non_live)} feed(s) are non-live but non-blocking: credential/access/geo/empty.")
         can_advise = len(active) >= required_active and len(active_types) >= required_types
         status = "LIVE_READY" if can_advise and reliability >= 70 else "SAFE_MODE"
         report = FeedReliabilityReport(status, len(active), len(active_types), required_active, required_types, round(reliability, 1), can_advise, messages, feed_type_status)

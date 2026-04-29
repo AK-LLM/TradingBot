@@ -1,75 +1,69 @@
-# Signal Trading Platform V5.2 Usage Guide
+# Usage Guide — V5.3
 
-## 1. Install
+## 1. Edit `.env`
 
-```bash
-pip install -r requirements.txt
-```
+Use `.env.example` as the template. Keep real keys only in `.env`.
 
-## 2. Configure API keys
-
-A blank/template `.env` file is included in the project root.
-Open it and fill in only the keys you currently have.
-
-Recommended starting config:
+Your current Canada-compatible setup can be:
 
 ```env
 OPTIONS_PROVIDER=polygon
-POLYGON_API_KEY=your_polygon_or_massive_key
-MARKETDATA_API_TOKEN=
+POLYGON_API_KEY=your_polygon_key_here
 TRADIER_TOKEN=
 KALSHI_API_KEY=
 KALSHI_API_SECRET=
-IBKR_HOST=127.0.0.1
-IBKR_PORT=7497
-IBKR_CLIENT_ID=1
+MARKETDATA_API_TOKEN=
+METACULUS_TOKEN=
 ```
 
-### Options providers
+Tradier and Kalshi stay in the suite for future use. Leaving their fields blank should not crash the system.
 
-- **Polygon/Massive**: default and recommended first provider.
-- **MarketData.app**: optional backup provider if you add `MARKETDATA_API_TOKEN`.
-- **Tradier**: still supported, but disabled unless `TRADIER_TOKEN` is provided.
-
-Set the preferred provider:
-
-```env
-OPTIONS_PROVIDER=polygon
-# or
-OPTIONS_PROVIDER=marketdata
-# or
-OPTIONS_PROVIDER=tradier
-```
-
-The suite will try the selected provider first, then fail over to the other configured options providers.
-
-## 3. Run the UI
+## 2. Start Streamlit
 
 ```bash
 streamlit run streamlit_app.py
 ```
 
-Use the UI for:
+Open the **Feed Health** tab after running a Shark Scan.
 
-- Feed Health
-- Shark Radar
-- Flash Alerts
-- Risk Dashboard
-- Paper/live execution review
-
-## 4. Run the portable watchdog
-
-For local installs, VPS, or cases where Streamlit Community cannot keep background work alive:
+## 3. Start always-on local monitoring
 
 ```bash
 python monitor.py --interval 60
 ```
 
-This runs monitoring independently of the Streamlit UI.
+Use this if Streamlit Community sleeps or if you want continuous local monitoring.
 
-## 5. Action advice scale
+## 4. What to expect in Feed Health
 
-The system preserves the action spectrum:
+Good signs:
+
+- Polymarket: `live`
+- PredictIt: `live`
+- Manifold: `live`
+- Stooq Market Pulse: `live`
+- CFTC COT: `live`
+- Options Flow: `live` once Polygon returns option rows
+- News RSS: `live` if at least one RSS source parses
+- Crypto Market Pulse: `live` using Binance, Kraken, or CoinGecko
+
+Non-blocking signs:
+
+- Metaculus: `access_limited` if anonymous API is restricted
+- Options Flow: `credential_pending` if no options provider key is set
+- Crypto provider internals: Binance may be blocked, but the collector falls back to Kraken/CoinGecko
+
+Bad sign:
+
+- `error` means a runtime bug or provider issue needs attention.
+
+## 5. Flash Alerts
+
+Flash alerts only promote the strongest confirmed anomalies. The system should require confirmation and sanity checks before flashing.
+
+## 6. Action Advice
+
+Advice scale is preserved:
 
 - Strong Buy
 - Buy
@@ -77,23 +71,4 @@ The system preserves the action spectrum:
 - Sell
 - Strong Sell
 
-Advice is only generated after confirmation and sanity checks.
-
-## 6. Flash alerts
-
-Flash alerts are intentionally strict. They fire only for the strongest confirmed anomalies.
-
-Expected behavior:
-
-- Signal detected
-- Two-feed confirmation checked
-- Feed-type diversity checked
-- Sanity checks applied
-- Flash alert generated only if the event is high-confidence
-
-## 7. Safety notes
-
-- Never commit your real `.env` to GitHub.
-- Use paper mode first.
-- Keep IBKR live routing disabled until feed health and risk behavior are verified.
-- Tradier does not work without a token; leaving `TRADIER_TOKEN=` blank disables it cleanly.
+Use paper mode first. Do not route live orders until feed health and risk controls have been validated.

@@ -1,13 +1,13 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, timezone
 import os, json, math, re, csv, io, xml.etree.ElementTree as ET
 import requests
 from app.models import Signal, new_id, now_iso
 from app.instrument_map import classify_narrative
 
-UA = os.getenv("SIGNAL_BOT_USER_AGENT", "signal-trading-platform-live contact:local")
+UA = os.getenv("SIGNAL_BOT_USER_AGENT", "signal-trading-platform/5.3 contact:local@example.com")
+SEC_UA = os.getenv("SEC_USER_AGENT", UA)
 TIMEOUT = float(os.getenv("LIVE_FEED_TIMEOUT", "10"))
 
 @dataclass
@@ -40,9 +40,15 @@ LIVE_FEEDS: Dict[str, FeedConfig] = {
     "cftc_cot": FeedConfig("cftc_cot", "CFTC COT", "positioning", []),
     "news_rss": FeedConfig("news_rss", "News RSS", "news", []),
     "stooq_market": FeedConfig("stooq_market", "Stooq Market Pulse", "market_data", []),
-    "binance_crypto": FeedConfig("binance_crypto", "Binance Crypto Pulse", "crypto_market_data", []),
+    "crypto_market": FeedConfig("crypto_market", "Crypto Market Pulse", "crypto_market_data", []),
     "options_flow": FeedConfig("options_flow", "Options Flow", "options", ["POLYGON_API_KEY or MARKETDATA_API_TOKEN or TRADIER_TOKEN"]),
 }
+
+class FeedAccessLimited(Exception):
+    pass
+
+class MissingCredential(Exception):
+    pass
 
 class LiveFeedCollector:
     def __init__(self, state: Dict[str, Any]):
@@ -64,13 +70,16 @@ class LiveFeedCollector:
             "cftc_cot": self.collect_cftc_cot,
             "news_rss": self.collect_news_rss,
             "stooq_market": self.collect_stooq_market_pulse,
-            "binance_crypto": self.collect_binance_crypto,
+            "crypto_market": self.collect_crypto_market,
+            "binance_crypto": self.collect_crypto_market,
             "options_flow": self.collect_options_flow,
         }
         for key in keys:
             cfg = LIVE_FEEDS.get(key)
-            if cfg is None:
-                health.append(FeedHealth(key, "disabled", "Feed is not in the live-supported registry", 0).to_dict())
+            if key == "binance_crypto":
+                cfg = LIVE_FEEDS["crypto_market"]
+            if cfg is None or key not in collectors:
+                health.append(FeedHealth(key, "not_supported", "Feed is not in the live-supported registry", 0).to_dict())
                 continue
             try:
                 rows = collectors[key](max_per_feed=max_per_feed)
@@ -79,7 +88,17 @@ class LiveFeedCollector:
                 msg = f"Collected {len(rows)} live item(s)" if rows else "Endpoint responded but no qualifying live items were found"
                 health.append(FeedHealth(cfg.name, status, msg, len(rows)).to_dict())
             except MissingCredential as e:
-                health.append(FeedHealth(cfg.name, "auth_required", str(e), 0).to_dict())
+                health.append(FeedHealth(cfg.name, "credential_pending", str(e), 0).to_dict())
+            except FeedAccessLimited as e:
+                health.append(FeedHealth(cfg.name, "access_limited", str(e), 0).to_dict())
+            except requests.HTTPError as e:
+                code = getattr(e.response, "status_code", None)
+                if code == 451:
+                    health.append(FeedHealth(cfg.name, "geo_blocked", f"Provider returned 451/geographic restriction: {short_err(e)}", 0).to_dict())
+                elif code in (401, 403):
+                    health.append(FeedHealth(cfg.name, "access_limited", f"Provider returned {code}: {short_err(e)}", 0).to_dict())
+                else:
+                    health.append(FeedHealth(cfg.name, "error", f"HTTP {code}: {short_err(e)}", 0).to_dict())
             except Exception as e:
                 health.append(FeedHealth(cfg.name, "error", f"{type(e).__name__}: {str(e)[:220]}", 0).to_dict())
         self.state["feed_health"] = health
@@ -110,9 +129,7 @@ class LiveFeedCollector:
             vol = as_float(m.get("volume24hr") or m.get("volume"))
             liq = as_float(m.get("liquidity"))
             p = probability_from_market(m)
-            direction = "BUY" if p >= 0.5 else "SELL"
-            confidence = 0.48 + min(0.18, math.log10(max(vol,1))/25) + min(0.25, abs(p-0.5))
-            out.append(self._signal("Polymarket", infer_symbol(title), direction, confidence, title, f"Live market probability {p:.2%}; 24h volume {vol:,.0f}; liquidity {liq:,.0f}.", abs(p-0.5)*100, {"feed_key":"polymarket", "feed_type":"prediction_market", "probability":p, "volume":vol, "liquidity":liq, "url":m.get("url") or m.get("slug"), "volume_zscore": volume_score(vol)}))
+            out.append(self._signal("Polymarket", infer_symbol(title), "BUY" if p >= 0.5 else "SELL", 0.48 + min(0.18, math.log10(max(vol,1))/25) + min(0.25, abs(p-0.5)), title, f"Live market probability {p:.2%}; 24h volume {vol:,.0f}; liquidity {liq:,.0f}.", abs(p-0.5)*100, {"feed_key":"polymarket", "feed_type":"prediction_market", "probability":p, "volume":vol, "liquidity":liq, "url":m.get("url") or m.get("slug"), "volume_zscore": volume_score(vol)}))
         return out
 
     def collect_predictit(self, max_per_feed: int = 25) -> List[Signal]:
@@ -129,23 +146,35 @@ class LiveFeedCollector:
         return out
 
     def collect_manifold(self, max_per_feed: int = 25) -> List[Signal]:
-        data = self._get_json("https://api.manifold.markets/v0/markets", {"limit":max_per_feed, "sort":"24-hour-vol"})
+        data = self._get_json("https://api.manifold.markets/v0/markets", {"limit": min(max_per_feed, 100)})
+        markets = data if isinstance(data, list) else []
+        markets = [m for m in markets if not m.get("isResolved")]
+        markets.sort(key=lambda m: (as_float(m.get("volume24Hours")), as_float(m.get("volume")), as_float(m.get("totalLiquidity"))), reverse=True)
         out: List[Signal] = []
-        for m in data if isinstance(data, list) else []:
+        for m in markets[:max_per_feed]:
             title = m.get("question") or "Manifold market"
             p = as_float(m.get("probability") or 0.5)
-            vol = as_float(m.get("volume24Hours"))
-            out.append(self._signal("Manifold", infer_symbol(title), "BUY" if p >= .5 else "SELL", .42+abs(p-.5)+min(.15, vol/10000), title, f"Live probability {p:.2%}; 24h volume {vol:,.0f}.", abs(p-.5)*100, {"feed_key":"manifold", "feed_type":"prediction_market", "probability":p, "volume":vol, "volume_zscore":volume_score(vol), "url":m.get("url")}))
+            vol = as_float(m.get("volume24Hours") or m.get("volume"))
+            out.append(self._signal("Manifold", infer_symbol(title), "BUY" if p >= .5 else "SELL", .42+abs(p-.5)+min(.15, vol/10000), title, f"Live probability {p:.2%}; recent/total volume {vol:,.0f}.", abs(p-.5)*100, {"feed_key":"manifold", "feed_type":"prediction_market", "probability":p, "volume":vol, "volume_zscore":volume_score(vol), "url":m.get("url")}))
         return out
 
     def collect_metaculus(self, max_per_feed: int = 25) -> List[Signal]:
-        data = self._get_json("https://www.metaculus.com/api2/questions/", {"limit":max_per_feed, "order_by":"-activity"})
+        token = os.getenv("METACULUS_TOKEN") or os.getenv("METACULUS_API_TOKEN")
+        headers = {"User-Agent": UA, "Accept":"application/json"}
+        if token:
+            headers["Authorization"] = f"Token {token}"
+        try:
+            data = self._get_json("https://www.metaculus.com/api/posts/", {"statuses":"open", "limit":max_per_feed, "order_by":"-activity"}, headers=headers)
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) in (401, 403) and not token:
+                raise FeedAccessLimited("Metaculus public API limited this request. Add METACULUS_TOKEN if your account has API access; feed remains visible but not counted as failed.")
+            raise
         rows = data.get("results", []) if isinstance(data, dict) else []
         out: List[Signal] = []
-        for q in rows[:max_per_feed]:
-            title = q.get("title") or q.get("question") or "Metaculus question"
-            p = metaculus_probability(q)
-            out.append(self._signal("Metaculus", infer_symbol(title), "BUY" if p >= .5 else "SELL", .42+abs(p-.5), title, f"Live active forecast. Approx community probability {p:.2%}.", abs(p-.5)*100, {"feed_key":"metaculus", "feed_type":"forecasting", "probability":p, "url":"https://www.metaculus.com/questions/"+str(q.get('id','')), "volume_zscore":1.0}))
+        for post in rows[:max_per_feed]:
+            title = post.get("title") or post.get("short_title") or "Metaculus forecast"
+            p = metaculus_post_probability(post)
+            out.append(self._signal("Metaculus", infer_symbol(title), "BUY" if p >= .5 else "SELL", .42+abs(p-.5), title, f"Live open Metaculus post. Approx community probability {p:.2%}.", abs(p-.5)*100, {"feed_key":"metaculus", "feed_type":"forecasting", "probability":p, "url":"https://www.metaculus.com/questions/"+str(post.get('id','')), "volume_zscore":1.0}))
         return out
 
     def collect_kalshi(self, max_per_feed: int = 25) -> List[Signal]:
@@ -162,22 +191,33 @@ class LiveFeedCollector:
     def collect_news_rss(self, max_per_feed: int = 25) -> List[Signal]:
         feeds = news_feed_urls()
         out: List[Signal] = []
+        errors: List[str] = []
         per = max(1, math.ceil(max_per_feed / max(1, len(feeds))))
         for url in feeds:
-            r = self.session.get(url, timeout=TIMEOUT, headers={"User-Agent": UA, "Accept":"application/rss+xml,application/xml,text/xml,*/*"})
-            r.raise_for_status()
-            root = ET.fromstring(r.content)
-            for item in root.findall(".//item")[:per]:
-                title = clean_html(item.findtext("title") or "News headline")
-                desc = clean_html(item.findtext("description") or "")[:500]
-                text = f"{title} {desc}"
-                narrative = classify_narrative(text)
-                symbol = infer_symbol(text)
-                direction = narrative_direction(narrative)
-                out.append(self._signal("News RSS", symbol, direction, .53, title, desc, 4.0, {"feed_key":"news_rss", "feed_type":"news", "narrative":narrative, "url":item.findtext("link"), "volume_zscore":1.4}))
-                if len(out) >= max_per_feed:
-                    return out
-        return out
+            try:
+                r = self.session.get(url, timeout=TIMEOUT, headers={"User-Agent": UA, "Accept":"application/rss+xml,application/atom+xml,application/xml,text/xml,*/*"})
+                r.raise_for_status()
+                root = ET.fromstring(r.content)
+                items = root.findall(".//item") or root.findall(".//{http://www.w3.org/2005/Atom}entry")
+                for item in items[:per]:
+                    title = clean_html(find_text(item, ["title", "{http://www.w3.org/2005/Atom}title"]) or "News headline")
+                    desc = clean_html(find_text(item, ["description", "summary", "{http://www.w3.org/2005/Atom}summary"]) or "")[:500]
+                    link = find_text(item, ["link", "{http://www.w3.org/2005/Atom}link"])
+                    if not link:
+                        link_node = item.find("{http://www.w3.org/2005/Atom}link")
+                        link = link_node.attrib.get("href") if link_node is not None else None
+                    text = f"{title} {desc}"
+                    narrative = classify_narrative(text)
+                    symbol = infer_symbol(text)
+                    out.append(self._signal("News RSS", symbol, narrative_direction(narrative), .53, title, desc, 4.0, {"feed_key":"news_rss", "feed_type":"news", "narrative":narrative, "url":link, "source_url":url, "volume_zscore":1.4}))
+                    if len(out) >= max_per_feed:
+                        return out
+            except Exception as exc:
+                errors.append(f"{url}: {type(exc).__name__} {str(exc)[:80]}")
+                continue
+        if out:
+            return out
+        raise RuntimeError("All RSS sources failed or returned no parseable items. " + " | ".join(errors[:4]))
 
     def collect_stooq_market_pulse(self, max_per_feed: int = 25) -> List[Signal]:
         symbols = stooq_symbols()[:max_per_feed]
@@ -190,31 +230,50 @@ class LiveFeedCollector:
             openp = row.get("open") or close
             vol = row.get("volume") or 0
             chg = ((close/openp)-1)*100 if openp else 0.0
-            direction = "BUY" if chg >= 0 else "SELL"
-            out.append(self._signal("Stooq Market Pulse", sym, direction, min(.86, .48+abs(chg)/20), f"{sym} market pulse {chg:+.2f}%", f"Live Stooq quote: open {openp}, last {close}, volume {vol:,.0f}.", abs(chg), {"feed_key":"stooq_market", "feed_type":"market_data", "price":close, "open":openp, "volume":vol, "probability_change_pct":abs(chg), "volume_zscore":volume_score(vol)}))
+            out.append(self._signal("Stooq Market Pulse", sym, "BUY" if chg >= 0 else "SELL", min(.86, .48+abs(chg)/20), f"{sym} market pulse {chg:+.2f}%", f"Live Stooq quote: open {openp}, last {close}, volume {vol:,.0f}.", abs(chg), {"feed_key":"stooq_market", "feed_type":"market_data", "price":close, "open":openp, "volume":vol, "probability_change_pct":abs(chg), "volume_zscore":volume_score(vol)}))
         return out
 
     def collect_sec_filings(self, max_per_feed: int = 25) -> List[Signal]:
-        tickers = os.getenv("SEC_TICKERS", "AAPL,MSFT,NVDA,TSLA,META,AMZN,GOOGL,AMD,XOM,CVX,JPM,GS,BA,PLTR,COIN,MSTR,VRT,ETN,GLD,SLV").split(",")
-        mapping = self._get_json("https://www.sec.gov/files/company_tickers.json")
-        by_ticker = {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in mapping.values()}
+        headers = {"User-Agent": SEC_UA, "Accept":"application/json,application/atom+xml,application/xml,*/*"}
+        tickers = [x.strip().upper() for x in os.getenv("SEC_TICKERS", "AAPL,MSFT,NVDA,TSLA,META,AMZN,GOOGL,AMD,XOM,CVX,JPM,GS,BA,PLTR,COIN,MSTR,VRT,ETN,GLD,SLV").split(",") if x.strip()]
+        try:
+            mapping = self._get_json("https://www.sec.gov/files/company_tickers.json", headers=headers)
+            by_ticker = {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in mapping.values()}
+            out: List[Signal] = []
+            for t in tickers[:max_per_feed]:
+                cik = by_ticker.get(t)
+                if not cik:
+                    continue
+                sub = self._get_json(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=headers)
+                recent = sub.get("filings", {}).get("recent", {})
+                forms = recent.get("form", []); dates = recent.get("filingDate", []); acc = recent.get("accessionNumber", [])
+                if not forms:
+                    continue
+                form, date, accno = forms[0], dates[0] if dates else "", acc[0] if acc else ""
+                mag = 7 if form in {"4", "8-K", "13D", "13G"} else 3
+                out.append(self._signal("SEC Filings", t, "BUY" if form in {"4", "13D", "13G"} else "WATCH", .55 if mag > 5 else .45, f"{t} SEC filing {form}", f"Live SEC filing observed: {form} filed {date}.", mag, {"feed_key":"sec_filings", "feed_type":"filings", "form":form, "filing_date":date, "accession":accno, "volume_zscore":1.0}))
+            if out:
+                return out
+        except Exception:
+            pass
+        return self.collect_sec_current_atom(max_per_feed=max_per_feed, headers=headers)
+
+    def collect_sec_current_atom(self, max_per_feed: int, headers: Dict[str, str]) -> List[Signal]:
+        r = self.session.get("https://www.sec.gov/cgi-bin/browse-edgar", params={"action":"getcurrent", "output":"atom", "count":max_per_feed}, timeout=TIMEOUT, headers=headers)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
         out: List[Signal] = []
-        for t in [x.strip().upper() for x in tickers if x.strip()][:max_per_feed]:
-            cik = by_ticker.get(t)
-            if not cik:
-                continue
-            sub = self._get_json(f"https://data.sec.gov/submissions/CIK{cik}.json")
-            recent = sub.get("filings", {}).get("recent", {})
-            forms = recent.get("form", []); dates = recent.get("filingDate", []); acc = recent.get("accessionNumber", [])
-            if not forms:
-                continue
-            form, date, accno = forms[0], dates[0] if dates else "", acc[0] if acc else ""
-            mag = 7 if form in {"4", "8-K", "13D", "13G"} else 3
-            out.append(self._signal("SEC Filings", t, "BUY" if form in {"4", "13D", "13G"} else "WATCH", .55 if mag > 5 else .45, f"{t} SEC filing {form}", f"Live SEC filing observed: {form} filed {date}.", mag, {"feed_key":"sec_filings", "feed_type":"filings", "form":form, "filing_date":date, "accession":accno, "volume_zscore":1.0}))
+        for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry")[:max_per_feed]:
+            title = clean_html(entry.findtext("{http://www.w3.org/2005/Atom}title") or "SEC current filing")
+            summary = clean_html(entry.findtext("{http://www.w3.org/2005/Atom}summary") or "")
+            form_match = re.search(r"\b(8-K|10-K|10-Q|4|13D|13G|S-1)\b", title + " " + summary)
+            form = form_match.group(1) if form_match else "FILING"
+            sym = infer_symbol(title + " " + summary)
+            out.append(self._signal("SEC Filings", sym, "BUY" if form in {"4", "13D", "13G"} else "WATCH", .50, f"SEC current filing {form}", title, 3.0, {"feed_key":"sec_filings", "feed_type":"filings", "form":form, "volume_zscore":1.0}))
         return out
 
     def collect_cftc_cot(self, max_per_feed: int = 25) -> List[Signal]:
-        r = self.session.get("https://www.cftc.gov/dea/newcot/f_disagg.txt", timeout=TIMEOUT)
+        r = self.session.get("https://www.cftc.gov/dea/newcot/f_disagg.txt", timeout=TIMEOUT, headers={"User-Agent": UA})
         r.raise_for_status()
         text = r.text
         out: List[Signal] = []
@@ -226,16 +285,50 @@ class LiveFeedCollector:
                 out.append(self._signal("CFTC COT", sym, "WATCH", .50, f"CFTC COT positioning available for {name}", snippet[:350], 3.0, {"feed_key":"cftc_cot", "feed_type":"positioning", "narrative":narr, "volume_zscore":1.0}))
         return out[:max_per_feed]
 
-    def collect_binance_crypto(self, max_per_feed: int = 25) -> List[Signal]:
+    def collect_crypto_market(self, max_per_feed: int = 25) -> List[Signal]:
+        errors: List[str] = []
+        for fn in (self._collect_binance_crypto, self._collect_kraken_crypto, self._collect_coingecko_crypto):
+            try:
+                rows = fn(max_per_feed)
+                if rows:
+                    return rows
+            except Exception as exc:
+                errors.append(f"{fn.__name__}: {type(exc).__name__} {str(exc)[:90]}")
+        raise RuntimeError("All crypto market providers failed. " + " | ".join(errors))
+
+    def _collect_binance_crypto(self, max_per_feed: int = 25) -> List[Signal]:
         data = self._get_json("https://api.binance.com/api/v3/ticker/24hr")
         wanted = {"BTCUSDT":"BTC", "ETHUSDT":"ETH", "SOLUSDT":"SOL"}
         out: List[Signal] = []
         for row in data:
             if row.get("symbol") in wanted:
                 sym = wanted[row["symbol"]]
-                chg = as_float(row.get("priceChangePercent"))
-                qvol = as_float(row.get("quoteVolume"))
-                out.append(self._signal("Binance Crypto Pulse", sym, "BUY" if chg >= 0 else "SELL", min(.85, .48+abs(chg)/30), f"{sym} crypto liquidity move {chg:+.2f}%", f"Live Binance 24h ticker. Quote volume {qvol:,.0f}.", abs(chg), {"feed_key":"binance_crypto", "feed_type":"crypto_market_data", "volume":qvol, "probability_change_pct":abs(chg), "volume_zscore":volume_score(qvol)}))
+                chg = as_float(row.get("priceChangePercent")); qvol = as_float(row.get("quoteVolume"))
+                out.append(self._signal("Crypto Market Pulse", sym, "BUY" if chg >= 0 else "SELL", min(.85, .48+abs(chg)/30), f"{sym} crypto liquidity move {chg:+.2f}%", f"Live Binance 24h ticker. Quote volume {qvol:,.0f}.", abs(chg), {"feed_key":"crypto_market", "feed_type":"crypto_market_data", "provider":"binance", "volume":qvol, "probability_change_pct":abs(chg), "volume_zscore":volume_score(qvol)}))
+        return out[:max_per_feed]
+
+    def _collect_kraken_crypto(self, max_per_feed: int = 25) -> List[Signal]:
+        data = self._get_json("https://api.kraken.com/0/public/Ticker", {"pair":"XBTUSD,ETHUSD,SOLUSD"})
+        result = data.get("result", {}) if isinstance(data, dict) else {}
+        aliases = {"XXBTZUSD":"BTC", "XBTUSD":"BTC", "XETHZUSD":"ETH", "ETHUSD":"ETH", "SOLUSD":"SOL"}
+        out: List[Signal] = []
+        for key, row in result.items():
+            sym = aliases.get(key, key.replace("ZUSD", "").replace("X", ""))
+            last = as_float((row.get("c") or [0])[0])
+            openp = as_float(row.get("o"), last)
+            vol = as_float((row.get("v") or [0,0])[1])
+            chg = ((last/openp)-1)*100 if openp else 0
+            out.append(self._signal("Crypto Market Pulse", sym, "BUY" if chg >= 0 else "SELL", min(.85, .48+abs(chg)/30), f"{sym} crypto liquidity move {chg:+.2f}%", f"Live Kraken ticker. Last {last}; 24h volume {vol:,.0f}.", abs(chg), {"feed_key":"crypto_market", "feed_type":"crypto_market_data", "provider":"kraken", "volume":vol, "price":last, "probability_change_pct":abs(chg), "volume_zscore":volume_score(vol)}))
+        return out[:max_per_feed]
+
+    def _collect_coingecko_crypto(self, max_per_feed: int = 25) -> List[Signal]:
+        data = self._get_json("https://api.coingecko.com/api/v3/simple/price", {"ids":"bitcoin,ethereum,solana", "vs_currencies":"usd", "include_24hr_change":"true", "include_24hr_vol":"true"})
+        mapping = {"bitcoin":"BTC", "ethereum":"ETH", "solana":"SOL"}
+        out: List[Signal] = []
+        for coin, sym in mapping.items():
+            row = data.get(coin, {}) if isinstance(data, dict) else {}
+            chg = as_float(row.get("usd_24h_change")); vol = as_float(row.get("usd_24h_vol")); price = as_float(row.get("usd"))
+            out.append(self._signal("Crypto Market Pulse", sym, "BUY" if chg >= 0 else "SELL", min(.85, .48+abs(chg)/30), f"{sym} crypto liquidity move {chg:+.2f}%", f"Live CoinGecko ticker. Last {price}; 24h volume {vol:,.0f}.", abs(chg), {"feed_key":"crypto_market", "feed_type":"crypto_market_data", "provider":"coingecko", "volume":vol, "price":price, "probability_change_pct":abs(chg), "volume_zscore":volume_score(vol)}))
         return out[:max_per_feed]
 
     def collect_options_flow(self, max_per_feed: int = 25) -> List[Signal]:
@@ -246,22 +339,19 @@ class LiveFeedCollector:
             try:
                 if p == "polygon" and os.getenv("POLYGON_API_KEY"):
                     rows = self._collect_polygon_options(max_per_feed)
-                    if rows:
-                        return rows
+                    if rows: return rows
                     errors.append("Polygon returned no qualifying options-flow rows")
                 elif p == "marketdata" and os.getenv("MARKETDATA_API_TOKEN"):
                     rows = self._collect_marketdata_options(max_per_feed)
-                    if rows:
-                        return rows
+                    if rows: return rows
                     errors.append("MarketData.app returned no qualifying options-flow rows")
                 elif p == "tradier" and os.getenv("TRADIER_TOKEN"):
                     rows = self._collect_tradier_options(max_per_feed)
-                    if rows:
-                        return rows
+                    if rows: return rows
                     errors.append("Tradier returned no qualifying options-flow rows")
             except Exception as exc:
                 errors.append(f"{p}: {exc}")
-        raise MissingCredential("Set POLYGON_API_KEY, MARKETDATA_API_TOKEN, or TRADIER_TOKEN to enable live options flow. " + "; ".join(errors[-3:]))
+        raise MissingCredential("Options flow is live-capable, but no configured provider returned usable rows. Set POLYGON_API_KEY, MARKETDATA_API_TOKEN, or TRADIER_TOKEN. " + "; ".join(errors[-3:]))
 
     def _collect_tradier_options(self, max_per_feed: int) -> List[Signal]:
         token = os.environ["TRADIER_TOKEN"]
@@ -272,31 +362,23 @@ class LiveFeedCollector:
         for sym in [s.strip().upper() for s in underlyings if s.strip()]:
             exp_data = self._get_json(f"{base}/markets/options/expirations", {"symbol": sym, "includeAllRoots":"true", "strikes":"false"}, headers)
             exps = exp_data.get("expirations", {}).get("date", []) if isinstance(exp_data, dict) else []
-            if isinstance(exps, str):
-                exps = [exps]
-            if not exps:
-                continue
+            if isinstance(exps, str): exps = [exps]
+            if not exps: continue
             chain = self._get_json(f"{base}/markets/options/chains", {"symbol": sym, "expiration": exps[0], "greeks":"true"}, headers)
             options = chain.get("options", {}).get("option", []) if isinstance(chain, dict) else []
-            if isinstance(options, dict):
-                options = [options]
+            if isinstance(options, dict): options = [options]
             scored = []
             for opt in options:
                 vol = as_float(opt.get("volume")); oi = max(1.0, as_float(opt.get("open_interest")))
-                ratio = vol / oi
-                bid = as_float(opt.get("bid")); ask = as_float(opt.get("ask")); last = as_float(opt.get("last"))
-                if vol <= 0 or ask <= 0:
-                    continue
+                ratio = vol / oi; bid = as_float(opt.get("bid")); ask = as_float(opt.get("ask")); last = as_float(opt.get("last"))
+                if vol <= 0 or ask <= 0: continue
                 scored.append((ratio, vol, opt, bid, ask, last))
             for ratio, vol, opt, bid, ask, last in sorted(scored, reverse=True)[:2]:
-                right = str(opt.get("option_type", "call")).lower()
-                direction = "BUY" if right == "call" else "SELL"
-                title = f"{sym} unusual {right} activity"
+                right = str(opt.get("option_type", "call")).lower(); direction = "BUY" if right == "call" else "SELL"
                 strike = opt.get("strike"); expiration = opt.get("expiration_date") or exps[0]
                 desc = f"Live Tradier option chain: {right} {strike} exp {expiration}; volume {vol:,.0f}; volume/open-interest {ratio:.2f}; bid {bid}; ask {ask}; last {last}."
-                out.append(self._signal("Tradier Options Flow", sym, direction, min(.88, .50 + min(.30, ratio/8) + min(.08, vol/5000)), title, desc, min(100, ratio*10), {"feed_key":"options_flow", "feed_type":"options", "option_type":right, "strike":strike, "expiration":expiration, "volume":vol, "open_interest":opt.get("open_interest"), "volume_oi_ratio":ratio, "volume_zscore":min(8, max(1, ratio))}))
-                if len(out) >= max_per_feed:
-                    return out
+                out.append(self._signal("Tradier Options Flow", sym, direction, min(.88, .50 + min(.30, ratio/8) + min(.08, vol/5000)), f"{sym} unusual {right} activity", desc, min(100, ratio*10), {"feed_key":"options_flow", "feed_type":"options", "provider":"tradier", "option_type":right, "strike":strike, "expiration":expiration, "volume":vol, "open_interest":opt.get("open_interest"), "volume_oi_ratio":ratio, "volume_zscore":min(8, max(1, ratio))}))
+                if len(out) >= max_per_feed: return out
         return out
 
     def _collect_marketdata_options(self, max_per_feed: int) -> List[Signal]:
@@ -305,23 +387,13 @@ class LiveFeedCollector:
         out: List[Signal] = []
         for sym in [s.strip().upper() for s in underlyings if s.strip()]:
             data = self._get_json(f"https://api.marketdata.app/v1/options/chain/{sym}/", {"token": token})
-            rows = normalize_marketdata_chain(data)
-            scored = []
-            for opt in rows:
-                vol = as_float(opt.get("volume")); oi = max(1.0, as_float(opt.get("openInterest") or opt.get("open_interest")))
-                if vol <= 0:
-                    continue
-                scored.append((vol/oi, vol, opt))
-            for ratio, vol, opt in sorted(scored, reverse=True)[:2]:
+            for ratio, vol, opt in score_option_rows(normalize_marketdata_chain(data))[:2]:
                 right = str(opt.get("side") or opt.get("type") or opt.get("optionType") or "call").lower()
                 direction = "BUY" if right.startswith("c") else "SELL"
-                strike = opt.get("strike") or opt.get("strikePrice")
-                expiration = opt.get("expiration") or opt.get("expirationDate")
-                title = f"{sym} unusual {right} activity"
+                strike = opt.get("strike") or opt.get("strikePrice"); expiration = opt.get("expiration") or opt.get("expirationDate")
                 desc = f"Live MarketData.app option chain: {right} {strike} exp {expiration}; volume {vol:,.0f}; volume/open-interest {ratio:.2f}."
-                out.append(self._signal("MarketData.app Options Flow", sym, direction, min(.88, .50 + min(.30, ratio/8) + min(.08, vol/5000)), title, desc, min(100, ratio*10), {"feed_key":"options_flow", "feed_type":"options", "option_type":right, "strike":strike, "expiration":expiration, "volume":vol, "open_interest":opt.get("openInterest") or opt.get("open_interest"), "volume_oi_ratio":ratio, "volume_zscore":min(8, max(1, ratio))}))
-                if len(out) >= max_per_feed:
-                    return out
+                out.append(self._signal("MarketData.app Options Flow", sym, direction, min(.88, .50 + min(.30, ratio/8) + min(.08, vol/5000)), f"{sym} unusual {right} activity", desc, min(100, ratio*10), {"feed_key":"options_flow", "feed_type":"options", "provider":"marketdata", "option_type":right, "strike":strike, "expiration":expiration, "volume":vol, "open_interest":opt.get("openInterest") or opt.get("open_interest"), "volume_oi_ratio":ratio, "volume_zscore":min(8, max(1, ratio))}))
+                if len(out) >= max_per_feed: return out
         return out
 
     def _collect_polygon_options(self, max_per_feed: int) -> List[Signal]:
@@ -335,48 +407,51 @@ class LiveFeedCollector:
             for row in rows:
                 day = row.get("day", {}) or {}; details = row.get("details", {}) or {}
                 vol = as_float(day.get("volume")); oi = max(1.0, as_float(row.get("open_interest")))
-                if vol <= 0:
-                    continue
+                if vol <= 0: continue
                 scored.append((vol/oi, vol, row, details))
             for ratio, vol, row, details in sorted(scored, reverse=True)[:2]:
-                right = str(details.get("contract_type", "call")).lower()
-                direction = "BUY" if right == "call" else "SELL"
+                right = str(details.get("contract_type", "call")).lower(); direction = "BUY" if right == "call" else "SELL"
                 strike = details.get("strike_price"); expiration = details.get("expiration_date")
-                title = f"{sym} unusual {right} activity"
                 desc = f"Live Polygon option snapshot: {right} {strike} exp {expiration}; volume {vol:,.0f}; volume/open-interest {ratio:.2f}."
-                out.append(self._signal("Polygon Options Flow", sym, direction, min(.88, .50 + min(.30, ratio/8) + min(.08, vol/5000)), title, desc, min(100, ratio*10), {"feed_key":"options_flow", "feed_type":"options", "option_type":right, "strike":strike, "expiration":expiration, "volume":vol, "open_interest":row.get("open_interest"), "volume_oi_ratio":ratio, "volume_zscore":min(8, max(1, ratio))}))
-                if len(out) >= max_per_feed:
-                    return out
+                out.append(self._signal("Polygon Options Flow", sym, direction, min(.88, .50 + min(.30, ratio/8) + min(.08, vol/5000)), f"{sym} unusual {right} activity", desc, min(100, ratio*10), {"feed_key":"options_flow", "feed_type":"options", "provider":"polygon", "option_type":right, "strike":strike, "expiration":expiration, "volume":vol, "open_interest":row.get("open_interest"), "volume_oi_ratio":ratio, "volume_zscore":min(8, max(1, ratio))}))
+                if len(out) >= max_per_feed: return out
         return out
 
+def short_err(e: Exception) -> str:
+    return str(e).replace("\n", " ")[:180]
+
+def find_text(node: ET.Element, names: List[str]) -> Optional[str]:
+    for name in names:
+        child = node.find(name)
+        if child is not None and child.text:
+            return child.text
+    return None
+
 def normalize_marketdata_chain(data: Any) -> List[Dict[str, Any]]:
-    if not isinstance(data, dict):
-        return []
-    # MarketData.app commonly returns column arrays. Convert either array-of-objects or columnar payloads.
-    if isinstance(data.get("results"), list):
-        return [x for x in data.get("results", []) if isinstance(x, dict)]
+    if not isinstance(data, dict): return []
+    if isinstance(data.get("results"), list): return [x for x in data.get("results", []) if isinstance(x, dict)]
     columns = ["optionSymbol", "expiration", "strike", "side", "bid", "ask", "last", "volume", "openInterest"]
     lengths = [len(data.get(c, [])) for c in columns if isinstance(data.get(c), list)]
-    if not lengths:
-        return []
-    n = max(lengths)
+    if not lengths: return []
     rows: List[Dict[str, Any]] = []
-    for i in range(n):
+    for i in range(max(lengths)):
         row: Dict[str, Any] = {}
         for c in columns:
             values = data.get(c)
-            if isinstance(values, list) and i < len(values):
-                row[c] = values[i]
+            if isinstance(values, list) and i < len(values): row[c] = values[i]
         rows.append(row)
     return rows
 
-class MissingCredential(Exception):
-    pass
+def score_option_rows(rows: List[Dict[str, Any]]) -> List[Tuple[float, float, Dict[str, Any]]]:
+    scored: List[Tuple[float, float, Dict[str, Any]]] = []
+    for opt in rows:
+        vol = as_float(opt.get("volume")); oi = max(1.0, as_float(opt.get("openInterest") or opt.get("open_interest")))
+        if vol > 0: scored.append((vol/oi, vol, opt))
+    return sorted(scored, reverse=True)
 
 def as_float(x: Any, default: float = 0.0) -> float:
     try:
-        if x is None or x == "":
-            return default
+        if x is None or x == "": return default
         return float(x)
     except Exception:
         return default
@@ -387,22 +462,34 @@ def volume_score(volume: float) -> float:
 def probability_from_market(m: Dict[str, Any]) -> float:
     prices = m.get("outcomePrices") or m.get("outcomesPrices") or []
     if isinstance(prices, str):
-        try:
-            prices = json.loads(prices)
-        except Exception:
-            prices = []
+        try: prices = json.loads(prices)
+        except Exception: prices = []
     try:
         nums = [float(x) for x in prices]
         return max(nums) if nums else 0.5
     except Exception:
         return 0.5
 
-def metaculus_probability(q: Dict[str, Any]) -> float:
-    pred = q.get("community_prediction") or q.get("prediction") or {}
-    if isinstance(pred, dict):
-        full = pred.get("full") if isinstance(pred.get("full"), dict) else {}
-        return as_float(full.get("q2", pred.get("q2", pred.get("probability", 0.5))), 0.5)
-    return 0.5
+def metaculus_post_probability(post: Dict[str, Any]) -> float:
+    vals: List[float] = []
+    wanted = {"q2", "probability", "community_prediction", "recency_weighted", "metaculus_prediction"}
+    def walk(obj: Any, depth: int = 0):
+        if depth > 5: return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                lk = str(k).lower()
+                if lk in wanted and isinstance(v, (int, float, str)):
+                    f = as_float(v, -1)
+                    if 0 <= f <= 1: vals.append(f)
+                elif lk in wanted and isinstance(v, dict):
+                    for kk in ["q2", "median", "probability"]:
+                        f = as_float(v.get(kk), -1)
+                        if 0 <= f <= 1: vals.append(f)
+                walk(v, depth+1)
+        elif isinstance(obj, list):
+            for x in obj[:10]: walk(x, depth+1)
+    walk(post)
+    return vals[0] if vals else 0.5
 
 def clean_html(s: str) -> str:
     return re.sub(r"<[^>]+>", " ", s or "").replace("&amp;", "&").strip()
@@ -412,8 +499,7 @@ def infer_symbol(text: str) -> str:
     rules = [
         (["oil", "crude", "opec", "venezuela", "iran", "tanker"], "CL"),
         (["natural gas", "lng", "pipeline", "power grid", "data center power"], "NG"),
-        (["gold", "safe haven"], "GLD"),
-        (["silver"], "SLV"),
+        (["gold", "safe haven"], "GLD"), (["silver"], "SLV"),
         (["fed", "rate", "inflation", "cpi", "treasury", "bond"], "TLT"),
         (["bitcoin", "crypto", "ethereum", "stablecoin"], "BTC"),
         (["nvidia", "gpu", "semiconductor", "chip", "ai"], "NVDA"),
@@ -423,28 +509,24 @@ def infer_symbol(text: str) -> str:
         (["bank", "credit", "liquidity", "recession", "vix"], "SPY"),
     ]
     for words, sym in rules:
-        if any(w in t for w in words):
-            return sym
+        if any(w in t for w in words): return sym
     return "SPY"
 
 def narrative_direction(narr: str) -> str:
-    return {
-        "oil_geopolitics":"BUY", "rate_cuts":"BUY", "ai_policy":"SELL", "crypto_regulation":"BUY",
-        "taiwan_risk":"SELL", "market_stress":"SELL", "precious_metals":"BUY",
-        "energy_infrastructure":"BUY", "water_infrastructure":"BUY", "data_center_infrastructure":"BUY"
-    }.get(narr, "WATCH")
+    return {"oil_geopolitics":"BUY", "rate_cuts":"BUY", "ai_policy":"SELL", "crypto_regulation":"BUY", "taiwan_risk":"SELL", "market_stress":"SELL", "precious_metals":"BUY", "energy_infrastructure":"BUY", "water_infrastructure":"BUY", "data_center_infrastructure":"BUY"}.get(narr, "WATCH")
 
 def news_feed_urls() -> List[str]:
     raw = os.getenv("NEWS_RSS_URLS")
     if raw:
         return [x.strip() for x in raw.split(",") if x.strip()]
     return [
-        "https://www.investing.com/rss/news_25.rss",
-        "https://www.investing.com/rss/news_301.rss",
+        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPY,QQQ,NVDA,TSLA,XLE,GLD,SLV&region=US&lang=en-US",
         "https://www.marketwatch.com/rss/topstories",
         "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
         "https://www.cftc.gov/PressRoom/PressReleases/rss.xml",
         "https://www.sec.gov/news/pressreleases.rss",
+        "https://www.investing.com/rss/news_25.rss",
+        "https://www.investing.com/rss/news_301.rss",
     ]
 
 def stooq_symbols() -> List[Tuple[str, str]]:
@@ -452,10 +534,8 @@ def stooq_symbols() -> List[Tuple[str, str]]:
     if raw:
         pairs = []
         for chunk in raw.split(","):
-            if ":" in chunk:
-                code, sym = chunk.split(":", 1)
-            else:
-                code, sym = chunk, chunk.split(".")[0]
+            if ":" in chunk: code, sym = chunk.split(":", 1)
+            else: code, sym = chunk, chunk.split(".")[0]
             pairs.append((code.strip().lower(), sym.strip().upper()))
         return pairs
     syms = ["spy","qqq","iwm","tlt","gld","slv","iau","sivr","sgol","gdx","sil","uso","ung","xle","vde","oih","icln","tan","ura","urnm","nlr","vrt","jci","tt","carr","etn","xyl","awk","pho","cgw","eqix","dlr","xom","cvx","nvda","amd","tsla","coin","mstr"]
@@ -466,12 +546,10 @@ def fetch_stooq_quote(session: requests.Session, stooq_code: str) -> Optional[Di
     r = session.get(url, timeout=TIMEOUT, headers={"User-Agent": UA})
     r.raise_for_status()
     rows = list(csv.DictReader(io.StringIO(r.text)))
-    if not rows:
-        return None
+    if not rows: return None
     row = rows[0]
     last = as_float(row.get("Close") or row.get("Last"))
-    if last <= 0:
-        return None
+    if last <= 0: return None
     return {"last": last, "open": as_float(row.get("Open"), last), "high": as_float(row.get("High"), last), "low": as_float(row.get("Low"), last), "volume": as_float(row.get("Volume"))}
 
 def collect_live_signals(state: Dict[str, Any], max_per_feed: int = 25, enabled_feeds: Optional[List[str]] = None) -> Tuple[List[Signal], List[Dict[str, Any]]]:
