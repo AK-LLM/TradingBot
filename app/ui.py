@@ -6,12 +6,39 @@ import pandas as pd
 from app.platform import TradingPlatform
 
 
+CA_SUFFIXES = (".TO", ".V", ".CN", ".NE")
+
+
+def is_canadian_symbol(sym: str) -> bool:
+    if not sym:
+        return False
+    return str(sym).upper().endswith(CA_SUFFIXES)
+
+
 def badge(score: float) -> str:
     if score >= 75:
         return "🦈 SHARK"
     if score >= 55:
         return "👀 WATCH"
     return "⚪ LOW"
+
+
+def stage_badge(stage: str) -> str:
+    return {
+        "SCOUT": "🔍 SCOUT",
+        "STALKING": "🦈 STALKING",
+        "STRIKING": "⚡ STRIKING",
+        "LATE": "🌊 LATE",
+    }.get(stage, stage)
+
+
+def urgency_badge(urgency: str) -> str:
+    return {
+        "CRITICAL": "🔴 CRITICAL",
+        "HIGH": "🟠 HIGH",
+        "MEDIUM": "🟡 MEDIUM",
+        "LOW": "🟢 LOW",
+    }.get(urgency, urgency)
 
 
 def flash_banner(p: TradingPlatform) -> None:
@@ -53,6 +80,21 @@ def flash_banner(p: TradingPlatform) -> None:
             st.rerun()
 
 
+def stop_alert_banner(p: TradingPlatform) -> None:
+    """V5.6: Surface critical stop alerts at top of page."""
+    stops_df = p.stop_alerts_df()
+    if stops_df.empty:
+        return
+    critical = stops_df[stops_df["urgency"] == "CRITICAL"]
+    if critical.empty:
+        return
+    for _, row in critical.iterrows():
+        st.error(
+            f"🛑 HARD STOP HIT: **{row.symbol}** at ${row.current_price} ({row.pct_from_entry:+.1f}% from entry). Suggested action: **{row.suggested_action}**. {row.reason}",
+            icon="🛑"
+        )
+
+
 def enable_auto_refresh(seconds: int) -> None:
     seconds = max(20, int(seconds))
     components.html(
@@ -65,20 +107,310 @@ def enable_auto_refresh(seconds: int) -> None:
     )
 
 
+def render_canada_view(p: TradingPlatform) -> None:
+    """Dedicated Canadian intelligence view."""
+    st.subheader("🇨🇦 Canadian Intelligence")
+    st.caption("Filtered view of Canadian-specific feeds, signals, instruments, and exposures.")
+
+    st.markdown("### Canadian Feed Health")
+    health = p.feed_health_df()
+    if not health.empty:
+        ca_keywords = ["canada", "canadian", "sedi", "statcan", "boc"]
+        ca_health = health[health["feed"].str.lower().str.contains("|".join(ca_keywords), na=False)]
+        if ca_health.empty:
+            st.info("Canadian feeds (Bank of Canada, SEDI, StatCan) have not run yet. Trigger a Shark Scan.")
+        else:
+            st.dataframe(ca_health, width="stretch", hide_index=True)
+    else:
+        st.info("No feed health data yet. Run a Shark Scan.")
+
+    st.markdown("### Canadian Signals (live)")
+    signals_df = p.signals_df()
+    if signals_df.empty:
+        st.info("No signals yet.")
+    else:
+        def is_ca_signal(row):
+            source = str(row.get("source", "")).lower()
+            symbol = str(row.get("symbol", ""))
+            meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+            if any(k in source for k in ["canada", "sedi", "statcan", "bank of canada"]):
+                return True
+            if is_canadian_symbol(symbol):
+                return True
+            if meta.get("jurisdiction") == "CA":
+                return True
+            if meta.get("narrative") == "canada_specific":
+                return True
+            return False
+        ca_mask = signals_df.apply(is_ca_signal, axis=1)
+        ca_signals = signals_df[ca_mask]
+        if ca_signals.empty:
+            st.info("No Canadian-specific signals fired this scan.")
+        else:
+            display_cols = ["created_at", "source", "symbol", "direction", "confidence", "title"]
+            available = [c for c in display_cols if c in ca_signals.columns]
+            st.dataframe(ca_signals[available].sort_values("confidence", ascending=False),
+                         width="stretch", hide_index=True)
+
+    st.markdown("### Alerts Featuring Canadian Instruments")
+    alerts = p.alerts_df()
+    if not alerts.empty:
+        ca_alerts = []
+        for _, a in alerts.iterrows():
+            instruments = a.get("instruments", []) if isinstance(a.get("instruments"), list) else []
+            ca_instruments = [i for i in instruments if is_canadian_symbol(i.get("symbol", ""))]
+            if is_canadian_symbol(a.primary_symbol) or ca_instruments:
+                ca_alerts.append({
+                    "narrative": a.narrative,
+                    "primary_symbol": a.primary_symbol,
+                    "direction": a.direction,
+                    "shark_score": a.shark_score,
+                    "status": a.status,
+                    "ca_instruments": ", ".join([i.get("symbol", "") for i in ca_instruments]) or "(direct)",
+                })
+        if ca_alerts:
+            st.dataframe(pd.DataFrame(ca_alerts), width="stretch", hide_index=True)
+        else:
+            st.info("No active alerts feature Canadian instruments. Canadian instruments are mapped across 22 narratives.")
+
+    st.markdown("### Canadian Constellations")
+    constellations = p.constellations_df()
+    if not constellations.empty:
+        ca_const = constellations[
+            (constellations["pattern_name"] == "Canadian Macro Divergence") |
+            (constellations["primary_symbol"].apply(is_canadian_symbol)) |
+            (constellations["primary_narrative"] == "canada_specific")
+        ]
+        if ca_const.empty:
+            st.info("No Canadian-specific constellation patterns detected this scan.")
+        else:
+            st.dataframe(ca_const[["pattern_name", "stage", "confidence", "direction", "primary_symbol", "description"]],
+                         width="stretch", hide_index=True)
+    else:
+        st.info("No constellations detected yet.")
+
+    st.markdown("### Canadian Instrument Coverage Map")
+    from app.instrument_map import NARRATIVE_MAP
+    ca_coverage = []
+    for narrative, instruments in NARRATIVE_MAP.items():
+        ca_inst = [i for i in instruments if is_canadian_symbol(i.get("symbol", ""))]
+        if ca_inst:
+            ca_coverage.append({
+                "narrative": narrative,
+                "ca_instruments": ", ".join([i["symbol"] for i in ca_inst]),
+                "count": len(ca_inst),
+            })
+    if ca_coverage:
+        cov_df = pd.DataFrame(ca_coverage).sort_values("count", ascending=False)
+        st.dataframe(cov_df, width="stretch", hide_index=True)
+        st.caption(f"Total: {sum(c['count'] for c in ca_coverage)} Canadian instruments across {len(ca_coverage)} narratives.")
+
+
+def render_constellations_tab(p: TradingPlatform) -> None:
+    """V5.5: Show constellation patterns with lifecycle stages."""
+    summary = p.constellation_summary()
+    cols = st.columns(5)
+    cols[0].metric("Total", summary.get("total_constellations", 0))
+    by_stage = summary.get("by_stage", {})
+    cols[1].metric("🔍 SCOUT", by_stage.get("SCOUT", 0))
+    cols[2].metric("🦈 STALKING", by_stage.get("STALKING", 0))
+    cols[3].metric("⚡ STRIKING", by_stage.get("STRIKING", 0))
+    cols[4].metric("🌊 LATE", by_stage.get("LATE", 0))
+
+    st.caption("Constellations are multi-feed patterns. SCOUT = early signal (you're ahead), LATE = consensus formed (you're behind).")
+
+    constellations_df = p.constellations_df()
+    if constellations_df.empty:
+        st.info("No constellation patterns detected yet. Run a Shark Scan to populate.")
+        return
+
+    fcol1, fcol2, fcol3 = st.columns(3)
+    stage_filter = fcol1.multiselect("Stage", ["SCOUT", "STALKING", "STRIKING", "LATE"],
+                                      default=["SCOUT", "STALKING", "STRIKING"])
+    direction_filter = fcol2.multiselect("Direction", ["BUY", "SELL", "WATCH"], default=["BUY", "SELL"])
+    pattern_filter = fcol3.multiselect("Pattern", sorted(constellations_df["pattern_name"].dropna().unique()))
+
+    filtered = constellations_df.copy()
+    if stage_filter:
+        filtered = filtered[filtered["stage"].isin(stage_filter)]
+    if direction_filter:
+        filtered = filtered[filtered["direction"].isin(direction_filter)]
+    if pattern_filter:
+        filtered = filtered[filtered["pattern_name"].isin(pattern_filter)]
+
+    if filtered.empty:
+        st.info("No constellations match the selected filters.")
+        return
+
+    for _, c in filtered.iterrows():
+        with st.container(border=True):
+            h1, h2, h3, h4 = st.columns([3, 1, 1, 1])
+            h1.subheader(f"⭐ {c.pattern_name}")
+            h2.metric("Stage", stage_badge(c.stage))
+            h3.metric("Direction", c.direction)
+            h4.metric("Confidence", f"{float(c.confidence):.2f}")
+            st.write(f"**Narrative:** `{c.primary_narrative}` · **Symbol:** `{c.primary_symbol}`")
+            if c.contributing_feeds is not None and len(c.contributing_feeds) > 0:
+                feeds_str = ', '.join(c.contributing_feeds) if isinstance(c.contributing_feeds, list) else str(c.contributing_feeds)
+                st.write(f"**Contributing feeds:** {feeds_str}")
+            st.write(f"**Description:** {c.description}")
+            st.info(f"**Why it matters:** {c.why_it_matters}")
+            if c.velocity_context:
+                st.caption(f"Velocity: {c.velocity_context}")
+
+
+def render_velocity_tab(p: TradingPlatform) -> None:
+    """V5.5: Velocity tracking."""
+    summary = p.velocity_summary()
+    cols = st.columns(5)
+    cols[0].metric("Channels", summary.get("total_channels", 0))
+    cols[1].metric("⚡ Up", summary.get("accelerating_up", 0))
+    cols[2].metric("📉 Down", summary.get("accelerating_down", 0))
+    cols[3].metric("⏸️ Stable", summary.get("stable", 0))
+    cols[4].metric("✨ New", summary.get("new_channels", 0))
+
+    st.caption("Velocity tracks how signal STRENGTH changes over time. A signal at 60 that was at 20 yesterday matters more than one at 80 that's been at 80 all week.")
+
+    velocity_df = p.velocity_df()
+    if velocity_df.empty:
+        st.info("Velocity tracking needs at least 4 scans to compute meaningful acceleration.")
+        return
+
+    if "acceleration" in velocity_df.columns:
+        priority = {"ACCELERATING_UP": 0, "NEW": 1, "ACCELERATING_DOWN": 2, "STABLE": 3}
+        velocity_df = velocity_df.copy()
+        velocity_df["_priority"] = velocity_df["acceleration"].map(priority).fillna(99)
+        velocity_df = velocity_df.sort_values(["_priority", "current_strength"], ascending=[True, False])
+        velocity_df = velocity_df.drop(columns=["_priority"])
+
+    st.dataframe(velocity_df, width="stretch", hide_index=True)
+
+
+def render_risk_intelligence_tab(p: TradingPlatform) -> None:
+    """V5.6: Stop alerts, correlation/sector exposures, VIX-adjusted sizing."""
+    summary = p.risk_intelligence_summary()
+
+    cols = st.columns(4)
+    cols[0].metric("🛑 Critical Stops", summary.get("stop_alerts_critical", 0))
+    cols[1].metric("⚠️ High Stops", summary.get("stop_alerts_high", 0))
+    cols[2].metric("Total Breaches", summary.get("total_breaches", 0))
+    vix_mult = summary.get("vix_size_multiplier", 1.0)
+    vix_label = "Full size" if vix_mult >= 1 else f"{int(vix_mult*100)}% (regime cut)"
+    cols[3].metric("VIX Multiplier", f"{vix_mult:.2f}", help=vix_label)
+
+    st.markdown("### 🛑 Auto-Stop Alerts")
+    stops = p.stop_alerts_df()
+    if stops.empty:
+        st.info("No stop alerts. Open positions are within stop thresholds.")
+    else:
+        s = p.settings()
+        st.caption(f"Soft stop fires REDUCE at {s.get('auto_stop_pct', 0.04)*100:.0f}% loss · Hard stop fires SELL at {s.get('hard_stop_pct', 0.07)*100:.0f}% loss · Trailing stop fires REDUCE at {s.get('trail_giveback_pct', 0.40)*100:.0f}% giveback of gains.")
+        for _, srow in stops.iterrows():
+            container_func = st.error if srow.urgency == "CRITICAL" else (st.warning if srow.urgency == "HIGH" else st.info)
+            container_func(
+                f"{urgency_badge(srow.urgency)} **{srow.symbol}** @ ${srow.current_price} ({srow.pct_from_entry:+.1f}% from entry, {srow.pct_from_high:+.1f}% from high) → **{srow.suggested_action}** · {srow.reason}"
+            )
+
+    st.markdown("### 🔗 Correlation Group Exposure")
+    corr = p.correlation_exposures_df()
+    if corr.empty:
+        st.info("No positions yet — no correlation exposure to display.")
+    else:
+        max_pct = p.settings().get("max_correlation_group_pct", 0.20) * 100
+        st.caption(f"Max per correlation group: {max_pct:.0f}%. XLE+XOM+CVX count as one 'energy' bucket.")
+        st.dataframe(corr, width="stretch", hide_index=True)
+        breaches = corr[corr["breach"] == True]  # noqa: E712
+        if not breaches.empty:
+            st.error(f"🔴 {len(breaches)} correlation group(s) in BREACH of cap.")
+
+    st.markdown("### 🏢 Sector Exposure")
+    sectors = p.sector_exposures_df()
+    if sectors.empty:
+        st.info("No positions yet — no sector exposure to display.")
+    else:
+        max_sec = p.settings().get("max_sector_pct", 0.30) * 100
+        st.caption(f"Max per sector: {max_sec:.0f}%.")
+        st.dataframe(sectors, width="stretch", hide_index=True)
+
+
+def render_settings_tab(p: TradingPlatform) -> None:
+    """V5.6.2: Full settings with V5.6 controls."""
+    s = p.settings()
+    st.subheader("All Settings")
+
+    with st.expander("Account / Trading", expanded=True):
+        st.json({k: v for k, v in s.items() if k in {
+            "broker_backend", "starting_cash", "cash_balance", "trading_halted",
+            "min_shark_score", "max_daily_loss", "max_drawdown_pct",
+            "risk_per_trade_pct", "max_position_pct", "max_trade_pct",
+            "max_total_exposure_pct", "max_open_positions", "max_consecutive_losses",
+            "symbol_cooldown_minutes", "max_spread_bps", "default_stop_pct",
+        }})
+
+    with st.expander("Confirmation / Sanity"):
+        st.json({k: v for k, v in s.items() if k in {
+            "min_independent_sources", "min_feed_type_confirmations",
+            "min_freshness_score", "min_tradability_score", "min_confirmation_score",
+            "max_move_before_entry_pct", "minimum_live_feeds_required", "minimum_feed_types_required",
+        }})
+
+    with st.expander("Flash / Watchdog"):
+        st.json({k: v for k, v in s.items() if k.startswith("flash_") or k.startswith("watchdog_")})
+
+    with st.expander("V5.6 Risk Intelligence", expanded=True):
+        st.markdown("**Settings for auto-stop, trailing-stop, correlation, sector, and VIX-adjusted sizing logic:**")
+        v56_keys = ["auto_stop_pct", "hard_stop_pct", "trail_trigger_pct",
+                    "trail_giveback_pct", "max_correlation_group_pct",
+                    "max_sector_pct", "vix_panic_threshold", "vix_elevated_threshold"]
+        st.json({k: s.get(k) for k in v56_keys})
+
+        st.markdown("---")
+        st.markdown("**Edit V5.6 Settings:**")
+        c1, c2 = st.columns(2)
+        new_auto_stop = c1.slider("Soft stop % (REDUCE alert)", 1.0, 10.0,
+                                   float(s.get("auto_stop_pct", 0.04)) * 100, 0.5) / 100
+        new_hard_stop = c2.slider("Hard stop % (SELL alert)", 3.0, 15.0,
+                                   float(s.get("hard_stop_pct", 0.07)) * 100, 0.5) / 100
+        c3, c4 = st.columns(2)
+        new_trail_trig = c3.slider("Trail trigger % (in profit)", 3.0, 20.0,
+                                    float(s.get("trail_trigger_pct", 0.06)) * 100, 0.5) / 100
+        new_trail_give = c4.slider("Trail giveback %", 20.0, 80.0,
+                                    float(s.get("trail_giveback_pct", 0.40)) * 100, 5.0) / 100
+        c5, c6 = st.columns(2)
+        new_corr = c5.slider("Max correlation group %", 5.0, 40.0,
+                              float(s.get("max_correlation_group_pct", 0.20)) * 100, 1.0) / 100
+        new_sec = c6.slider("Max sector %", 10.0, 60.0,
+                             float(s.get("max_sector_pct", 0.30)) * 100, 1.0) / 100
+        c7, c8 = st.columns(2)
+        new_vix_p = c7.slider("VIX panic threshold", 25, 50, int(s.get("vix_panic_threshold", 30)))
+        new_vix_e = c8.slider("VIX elevated threshold", 15, 30, int(s.get("vix_elevated_threshold", 20)))
+
+        if st.button("Save V5.6 Risk Settings"):
+            p.update_settings({
+                "auto_stop_pct": new_auto_stop, "hard_stop_pct": new_hard_stop,
+                "trail_trigger_pct": new_trail_trig, "trail_giveback_pct": new_trail_give,
+                "max_correlation_group_pct": new_corr, "max_sector_pct": new_sec,
+                "vix_panic_threshold": new_vix_p, "vix_elevated_threshold": new_vix_e,
+            })
+            st.success("V5.6 risk settings saved")
+            st.rerun()
+
+
 def main():
-    st.set_page_config(page_title="Signal Trading Platform V5.1", layout="wide")
+    st.set_page_config(page_title="Signal Trading Platform V5.6.2", layout="wide")
     p = TradingPlatform()
     s = p.settings()
 
     if s.get("watchdog_enabled"):
         enable_auto_refresh(int(s.get("watchdog_interval_seconds", 60)))
-        # A Streamlit app cannot truly run while closed/asleep. This cycle executes on each rerun.
         result = p.watchdog_cycle(max_signals=int(s.get("watchdog_max_signals", 80)))
         st.toast(f"Watchdog cycle: {result['signals']} signals, {result['new_flash_alerts']} new flash alert(s)")
 
     flash_banner(p)
-    st.title("🦈 Signal Trading Platform V5.1 — Flash + Portable Watchdog")
-    st.caption("Live-only intelligence, 2-feed confirmation, sanity validation, Strong Buy/Buy/Hold/Sell/Strong Sell advice, UI flash alerts, and local CLI monitoring.")
+    stop_alert_banner(p)
+
+    st.title("🦈 Signal Trading Platform V5.6.2 — Shark Radar Brain + Canadian Intelligence")
+    st.caption("Live-only intelligence · 24 feeds (5 Canadian) · 11 constellation patterns · Velocity tracking · Auto-stops · Correlation/sector caps · VIX-adjusted sizing · Full Strong Buy/Buy/REDUCE/Hold/Sell/Strong Sell spectrum")
 
     with st.sidebar:
         st.header("Controls")
@@ -113,14 +445,10 @@ def main():
         watchdog_max = st.number_input("Watchdog signals/cycle", min_value=20, max_value=200, value=int(s.get("watchdog_max_signals", 80)), step=10)
         if st.button("Save settings"):
             p.update_settings({
-                "broker_backend": backend,
-                "min_shark_score": min_score,
-                "starting_cash": cash,
-                "trading_halted": halted,
-                "flash_alerts_enabled": flash_on,
-                "flash_min_score": flash_score,
-                "flash_min_confidence": flash_conf,
-                "watchdog_enabled": watchdog_on,
+                "broker_backend": backend, "min_shark_score": min_score,
+                "starting_cash": cash, "trading_halted": halted,
+                "flash_alerts_enabled": flash_on, "flash_min_score": flash_score,
+                "flash_min_confidence": flash_conf, "watchdog_enabled": watchdog_on,
                 "watchdog_interval_seconds": int(watchdog_seconds),
                 "watchdog_max_signals": int(watchdog_max),
             })
@@ -130,16 +458,26 @@ def main():
     status = p.status()
     risk = p.risk_snapshot()
     rel = p.feed_reliability_report()
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    risk_intel = p.risk_intelligence_summary()
+    const_summary = p.constellation_summary()
+
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Equity", f"${status.get('equity', 0):,.2f}")
     c2.metric("Cash", f"${status.get('cash_balance', 0):,.2f}")
     c3.metric("Drawdown", f"{risk.get('drawdown_pct', 0):.2f}%")
     c4.metric("Risk", risk.get("risk_status", "NORMAL"))
     c5.metric("Feeds", rel.get("system_status", "SAFE_MODE"))
-    c6.metric("Backend", status.get("backend", "paper"))
-    c7.metric("Flash", len(p.flash_alerts_df()[p.flash_alerts_df().get("acknowledged", pd.Series(dtype=bool)) != True]) if not p.flash_alerts_df().empty else 0)  # noqa: E712
+    c6.metric("Flash", len(p.flash_alerts_df()[p.flash_alerts_df().get("acknowledged", pd.Series(dtype=bool)) != True]) if not p.flash_alerts_df().empty else 0)  # noqa: E712
+    c7.metric("⭐ Patterns", const_summary.get("total_constellations", 0))
+    c8.metric("🛑 Stops", risk_intel.get("stop_alerts_critical", 0) + risk_intel.get("stop_alerts_high", 0))
 
-    tabs = st.tabs(["🚨 Flash", "🦈 Shark Alerts", "Action Advice", "Risk", "Feed Reliability", "Signal Feed", "Feed Health", "Orders/Fills", "Positions", "Journal", "Settings"])
+    tabs = st.tabs([
+        "🚨 Flash", "🦈 Shark Alerts", "⭐ Constellations", "⚡ Velocity",
+        "🛡️ Risk Intelligence", "🇨🇦 Canada View", "Action Advice", "Risk",
+        "Feed Reliability", "Signal Feed", "Feed Health", "Orders/Fills",
+        "Positions", "Journal", "Settings"
+    ])
+
     with tabs[0]:
         st.subheader("Flash Alert Queue")
         flash = p.flash_alerts_df()
@@ -155,7 +493,7 @@ def main():
         if not hist.empty:
             st.subheader("Flash History")
             st.dataframe(hist.tail(100), width="stretch", hide_index=True)
-        st.info("For always-on monitoring independent of Streamlit, run: python monitor.py --interval 60")
+        st.info("For always-on monitoring, run: python monitor.py --interval 60")
 
     with tabs[1]:
         alerts = p.alerts_df()
@@ -166,7 +504,8 @@ def main():
             for _, a in top.iterrows():
                 with st.container(border=True):
                     h1, h2, h3, h4, h5, h6 = st.columns([2, 1, 1, 1, 1, 1])
-                    h1.subheader(f"{badge(float(a.shark_score))} {a.narrative}")
+                    ca_marker = " 🇨🇦" if is_canadian_symbol(a.primary_symbol) else ""
+                    h1.subheader(f"{badge(float(a.shark_score))} {a.narrative}{ca_marker}")
                     h2.metric("Score", a.shark_score)
                     h3.metric("Shock", a.shock_score)
                     h4.metric("Confirm", a.confirmation_score)
@@ -177,11 +516,18 @@ def main():
                     st.write(f"**Status:** {a.status} | **Direction:** {a.direction} | **Primary:** {a.primary_symbol} | **Action:** {a.action} | **Trend:** {advice.get('trend_stage', 'n/a')}")
                     st.write("**Evidence:** " + " · ".join(a.evidence))
                     if advice:
-                        st.success(f"Advice: {str(advice.get('action')).replace('_', ' ')} — {advice.get('reason')}")
+                        action_str = str(advice.get('action')).replace('_', ' ')
+                        if "REDUCE" in str(advice.get("action", "")):
+                            st.warning(f"⚠️ Advice: {action_str} — {advice.get('reason')}")
+                        else:
+                            st.success(f"Advice: {action_str} — {advice.get('reason')}")
+                        st.caption(f"Summary: {advice.get('confirmation_summary', '')}")
                     if a.warnings:
                         st.warning(" | ".join(a.warnings))
                     inst = pd.DataFrame(a.instruments)
                     if not inst.empty:
+                        if "symbol" in inst.columns:
+                            inst["jurisdiction"] = inst["symbol"].apply(lambda x: "🇨🇦 CA" if is_canadian_symbol(x) else "🇺🇸 US")
                         st.dataframe(inst, width="stretch", hide_index=True)
                     colA, colB = st.columns([1, 4])
                     dollars = colA.number_input("Paper $", min_value=100.0, value=800.0, step=100.0, key=f"dol_{a.id}")
@@ -191,9 +537,22 @@ def main():
                             st.success(f"Paper order {res['order']['status']}: {res['order']['symbol']}")
                         else:
                             st.error(res.get("error"))
+
     with tabs[2]:
+        render_constellations_tab(p)
+
+    with tabs[3]:
+        render_velocity_tab(p)
+
+    with tabs[4]:
+        render_risk_intelligence_tab(p)
+
+    with tabs[5]:
+        render_canada_view(p)
+
+    with tabs[6]:
         advice = p.advice_df()
-        st.caption("Action scale is preserved: Strong Buy, Buy, Hold, Sell, Strong Sell. REDUCE may appear when risk says trim rather than fully sell.")
+        st.caption("Action scale: Strong Sell · Sell · REDUCE · Hold · Buy · Strong Buy. REDUCE fires when risk says trim rather than fully exit.")
         if advice.empty:
             st.info("No action advice yet. Run a Shark Scan.")
         else:
@@ -201,7 +560,8 @@ def main():
             if "action" in show.columns:
                 show["action"] = show["action"].astype(str).str.replace("_", " ")
             st.dataframe(show, width="stretch", hide_index=True)
-    with tabs[3]:
+
+    with tabs[7]:
         snap = p.risk_snapshot()
         cols = st.columns(5)
         cols[0].metric("Risk Status", snap.get("risk_status"))
@@ -212,10 +572,12 @@ def main():
         if snap.get("messages"):
             st.warning(" | ".join(snap.get("messages", [])))
         st.json(snap)
-    with tabs[4]:
+
+    with tabs[8]:
         st.json(rel)
         st.caption("LIVE_READY allows trade advice; SAFE_MODE still monitors but blocks trade-candidate promotion.")
-    with tabs[5]:
+
+    with tabs[9]:
         df = p.signals_df()
         if df.empty:
             st.info("No signals yet.")
@@ -224,34 +586,59 @@ def main():
             show["metadata"] = show.get("metadata", pd.Series([{} for _ in range(len(show))]))
             show["narrative"] = show["metadata"].apply(lambda x: x.get("narrative") if isinstance(x, dict) else None)
             show["feed_type"] = show["metadata"].apply(lambda x: x.get("feed_type") if isinstance(x, dict) else None)
+            show["noise"] = show["metadata"].apply(lambda x: x.get("noise_level") if isinstance(x, dict) else None)
+            show["jurisdiction"] = show["metadata"].apply(lambda x: x.get("jurisdiction") if isinstance(x, dict) else None)
             show["prob_change"] = show["metadata"].apply(lambda x: x.get("probability_change_pct") if isinstance(x, dict) else None)
-            show["volume_z"] = show["metadata"].apply(lambda x: x.get("volume_zscore") if isinstance(x, dict) else None)
-            cols = ["created_at", "source", "feed_type", "symbol", "direction", "confidence", "magnitude", "narrative", "prob_change", "volume_z", "title"]
+
+            fc1, fc2, fc3 = st.columns(3)
+            noise_filter = fc1.multiselect("Noise level", ["low", "medium", "high"], default=[])
+            jur_filter = fc2.multiselect("Jurisdiction", ["CA", "US"], default=[])
+            ft_options = sorted([x for x in show["feed_type"].dropna().unique()]) if "feed_type" in show.columns else []
+            ft_filter = fc3.multiselect("Feed type", ft_options)
+
+            if noise_filter:
+                show = show[show["noise"].isin(noise_filter)]
+            if jur_filter:
+                ca_mask = (show["jurisdiction"] == "CA") | (show["symbol"].apply(is_canadian_symbol))
+                if "CA" in jur_filter and "US" not in jur_filter:
+                    show = show[ca_mask]
+                elif "US" in jur_filter and "CA" not in jur_filter:
+                    show = show[~ca_mask]
+            if ft_filter:
+                show = show[show["feed_type"].isin(ft_filter)]
+
+            cols = ["created_at", "source", "feed_type", "noise", "symbol", "direction", "confidence", "magnitude", "narrative", "jurisdiction", "prob_change", "title"]
             for col in cols:
                 if col not in show.columns:
                     show[col] = None
             st.dataframe(show[cols], width="stretch", hide_index=True)
-    with tabs[6]:
+
+    with tabs[10]:
         health = p.feed_health_df()
         if health.empty:
             st.info("No feed health yet. Run a live Shark Scan.")
         else:
             st.dataframe(health, width="stretch", hide_index=True)
-    with tabs[7]:
+
+    with tabs[11]:
         st.subheader("Orders")
         orders = p.orders_df()
         st.dataframe(orders, width="stretch", hide_index=True) if not orders.empty else st.info("No orders yet.")
         st.subheader("Fills")
         fills = p.fills_df()
         st.dataframe(fills, width="stretch", hide_index=True) if not fills.empty else st.info("No fills yet.")
-    with tabs[8]:
+
+    with tabs[12]:
         st.dataframe(p.positions_df(), width="stretch", hide_index=True)
-    with tabs[9]:
+
+    with tabs[13]:
         journal = p.journal_df().tail(250)
         st.dataframe(journal, width="stretch", hide_index=True) if not journal.empty else st.info("No journal entries yet.")
-    with tabs[10]:
-        st.json(p.settings())
-        st.info("Streamlit Community may sleep. For reliable always-on monitoring, run the local worker: python monitor.py --interval 60")
+
+    with tabs[14]:
+        render_settings_tab(p)
+        st.info("Streamlit Community may sleep. For always-on monitoring, run: python monitor.py --interval 60")
+
 
 if __name__ == "__main__":
     main()
