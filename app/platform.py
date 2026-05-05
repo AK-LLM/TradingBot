@@ -53,34 +53,42 @@ class TradingPlatform:
     def scan_signals(self, max_signals: int = 40, enabled_feeds: Optional[List[str]] = None) -> int:
         signals, _health = collect_live_signals(self.state, max_per_feed=max(5, max_signals // 4), enabled_feeds=enabled_feeds)
         reliability = self.reliability.evaluate()
-        alerts = self.shark.build_alerts(signals)
         signals_dicts = [s.to_dict() for s in signals]
         self.state["signals"] = signals_dicts
-        self.state["alerts"] = [a.to_dict() for a in alerts]
-        # === V5.5 Intelligence Pipeline ===
-        # 1. Record signals into velocity history
+
+        # === V5.6 PIPELINE FIX: Detect constellations + risk intel BEFORE building alerts ===
+        # Otherwise the intelligence engine runs without context and flash alerts use stale advice.
+
+        # 1. Velocity tracking on raw signals
         self.velocity.record(signals_dicts)
-        # 2. Compute velocity readings
         velocity_readings = self.velocity.compute_velocities()
         self.state["velocity_summary"] = self.velocity.summary()
         self.state["velocity_readings"] = [r.to_dict() for r in velocity_readings]
-        # 3. Detect constellations using signals + velocity context
+
+        # 2. Detect constellations BEFORE alert generation so intelligence engine sees them
         constellations = self.constellations.detect_all(signals_dicts, velocity_readings)
         self.state["constellations"] = [c.to_dict() for c in constellations]
         self.state["constellation_summary"] = summarize_constellations(self.state, constellations)
-        # === End V5.5 Pipeline ===
-        # === V5.6 Risk Intelligence Pipeline ===
-        # Mark to market positions first so stop checks use latest prices
+
+        # 3. Mark positions to market and run risk intelligence BEFORE alert generation
+        # so the intelligence engine has live position prices and stop alerts available
         try:
             self.broker().mark_to_market() if self.state["settings"].get("broker_backend") == "paper" else None
         except Exception:
             pass
-        # Now run all risk intelligence checks
         self.risk_intel.evaluate_all()
-        # === End V5.6 Pipeline ===
+
+        # 4. NOW build alerts — intelligence.advise() can see constellations + risk intel + velocity
+        alerts = self.shark.build_alerts(signals)
+        self.state["alerts"] = [a.to_dict() for a in alerts]
+
+        # 5. Action advice summary (using the same enriched state)
         self.state["action_advice"] = summarize_alert_actions(self.state)
+
+        # 6. Flash alerts now operate on the fully-enriched alerts
         if self.state.get("settings", {}).get("flash_alerts_enabled", True):
             self.flash.evaluate()
+
         self.state["risk_snapshot"] = self.risk.snapshot().to_dict()
         self.state["journal"].append({
             "ts": now_iso(),

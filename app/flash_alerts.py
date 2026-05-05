@@ -7,7 +7,7 @@ from app.models import new_id, now_iso
 ACTION_RANK = {
     "STRONG_SELL": 5,
     "SELL": 4,
-    "REDUCE": 2,
+    "REDUCE": 4,    # V5.6: REDUCE is now a real, directional action — eligible for flash alerts
     "HOLD": 0,
     "BUY": 4,
     "STRONG_BUY": 5,
