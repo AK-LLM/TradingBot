@@ -95,6 +95,16 @@ class RiskEngine:
             reasons.append("Spread exceeds execution limit.")
         if snap.risk_status == "COOLDOWN" and side == "buy":
             reasons.append("Loss-streak cooldown active.")
+        # === V5.6: Correlation group check ===
+        if side == "buy":
+            try:
+                from app.risk_intelligence import RiskIntelligence
+                ri = RiskIntelligence(self.state)
+                corr_check = ri.check_correlation_capacity(sym, gross)
+                if not corr_check["approved"]:
+                    reasons.append(f"Correlation cap: {corr_check['reason']}")
+            except Exception:
+                pass  # Don't break order flow if risk_intel unavailable
         return {"approved": len(reasons) == 0, "reasons": reasons, "warnings": warnings, "estimated_gross": round(gross, 2), **snap.to_dict()}
 
     def validate_alert(self, alert: Dict[str, Any]) -> Dict[str, Any]:

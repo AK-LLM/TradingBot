@@ -51,6 +51,12 @@ LIVE_FEEDS: Dict[str, FeedConfig] = {
     "grid_power": FeedConfig("grid_power", "Power Grid Pulse", "power_grid", []),
     "shipping_events": FeedConfig("shipping_events", "Shipping/Supply Chain Events", "supply_chain", []),
     "bank_of_canada": FeedConfig("bank_of_canada", "Bank of Canada Macro", "canada_macro", []),
+    # === V5.4 Extended Feeds (5 surgical additions) ===
+    "sedi_canada": FeedConfig("sedi_canada", "SEDI Canadian Insider Trades", "canada_filings", []),
+    "statcan_macro": FeedConfig("statcan_macro", "StatCan Economic Pulse", "canada_macro", []),
+    "volatility_regime": FeedConfig("volatility_regime", "Volatility Regime (VIX/Credit)", "regime_context", []),
+    "google_trends": FeedConfig("google_trends", "Google Trends Attention", "attention", []),
+    "reddit_sentiment": FeedConfig("reddit_sentiment", "Reddit Crowd Sentiment", "crowd_sentiment", []),
 }
 
 class FeedAccessLimited(Exception):
@@ -90,6 +96,12 @@ class LiveFeedCollector:
             "grid_power": self.collect_grid_power,
             "shipping_events": self.collect_shipping_events,
             "bank_of_canada": self.collect_bank_of_canada,
+            # === V5.4 Extended Feeds (delegated to extended_feeds module) ===
+            "sedi_canada": self._extended("sedi_canada"),
+            "statcan_macro": self._extended("statcan_macro"),
+            "volatility_regime": self._extended("volatility_regime"),
+            "google_trends": self._extended("google_trends"),
+            "reddit_sentiment": self._extended("reddit_sentiment"),
         }
         for key in keys:
             cfg = LIVE_FEEDS.get(key)
@@ -129,6 +141,16 @@ class LiveFeedCollector:
         r = self.session.get(url, params=params, timeout=TIMEOUT, headers=h)
         r.raise_for_status()
         return r.json()
+
+    def _extended(self, key: str):
+        """Dispatcher to extended feeds module. Returns a callable matching the collector signature."""
+        from app.extended_feeds import EXTENDED_COLLECTORS
+        def _runner(max_per_feed: int = 25):
+            collector = EXTENDED_COLLECTORS.get(key)
+            if collector is None:
+                return []
+            return collector(max_per_feed=max_per_feed)
+        return _runner
 
     def _signal(self, source: str, symbol: str, direction: str, confidence: float, title: str, desc: str, magnitude: float = 0.0, meta: Optional[Dict[str, Any]] = None) -> Signal:
         meta = meta or {}

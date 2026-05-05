@@ -46,6 +46,15 @@ DEFAULT_STATE: Dict[str, Any] = {
         "flash_cooldown_minutes": 20,
         "flash_active_ttl_minutes": 180,
         "flash_allowed_trend_stages": ["EMERGING", "CONFIRMED"],
+        # === V5.6 Risk Intelligence settings ===
+        "auto_stop_pct": 0.04,           # Soft stop -> REDUCE alert at 4% loss from entry
+        "hard_stop_pct": 0.07,           # Hard stop -> SELL alert at 7% loss from entry
+        "trail_trigger_pct": 0.06,       # Trailing logic activates once 6% in profit
+        "trail_giveback_pct": 0.40,      # Triggers REDUCE if giving back 40% of gains
+        "max_correlation_group_pct": 0.20, # Max 20% of equity in any one correlation group
+        "max_sector_pct": 0.30,          # Max 30% of equity in any one sector
+        "vix_panic_threshold": 30,       # VIX above this triggers 50% size reduction
+        "vix_elevated_threshold": 20,    # VIX above this triggers 25% size reduction
     },
     "signals": [],
     "alerts": [],
@@ -63,6 +72,12 @@ DEFAULT_STATE: Dict[str, Any] = {
     "active_flash_alerts": [],
     "flash_history": [],
     "last_watchdog_run": None,
+    # V5.6 risk intelligence state
+    "stop_alerts": [],
+    "correlation_exposures": [],
+    "sector_exposures": [],
+    "risk_intelligence": {},
+    "position_high_watermarks": {},
 }
 
 class JsonStore:
