@@ -18,6 +18,9 @@ from app.velocity_tracker import VelocityTracker
 from app.constellation_engine import ConstellationEngine, summarize_constellations
 # V5.6 Risk Intelligence
 from app.risk_intelligence import RiskIntelligence
+# V5.7 Decision Engine + Executor
+from app.decision_engine import DecisionEngine
+from app.decision_executor import DecisionExecutor
 
 class TradingPlatform:
     def __init__(self, store_path: str = "data/state.json") -> None:
@@ -33,6 +36,9 @@ class TradingPlatform:
         self.constellations = ConstellationEngine(self.state)
         # V5.6 Risk Intelligence
         self.risk_intel = RiskIntelligence(self.state)
+        # V5.7 Decision Engine + Executor
+        self.decisions = DecisionEngine(self.state)
+        self.executor = DecisionExecutor(self)
 
     def save(self) -> None:
         self.store.save(self.state)
@@ -85,7 +91,22 @@ class TradingPlatform:
         # 5. Action advice summary (using the same enriched state)
         self.state["action_advice"] = summarize_alert_actions(self.state)
 
-        # 6. Flash alerts now operate on the fully-enriched alerts
+        # 6. V5.7: Build Decision packages from enriched alerts
+        decisions_built = self.decisions.build_decisions()
+        self.state["decision_summary"] = self.decisions.summary()
+
+        # 7. V5.7: Auto-execute pass (PAPER ONLY - hardcoded)
+        auto_results = self.executor.run_auto_execute_pass()
+        if auto_results:
+            self.state.setdefault("journal", []).append({
+                "ts": now_iso(),
+                "event": "auto_execute_pass",
+                "executed": len([r for r in auto_results if r.get("ok")]),
+                "failed": len([r for r in auto_results if not r.get("ok")]),
+                "details": auto_results,
+            })
+
+        # 8. Flash alerts now operate on the fully-enriched alerts
         if self.state.get("settings", {}).get("flash_alerts_enabled", True):
             self.flash.evaluate()
 
@@ -97,6 +118,8 @@ class TradingPlatform:
             "signals": len(signals),
             "alerts": len(alerts),
             "constellations": len(constellations),
+            "decisions": len(decisions_built),
+            "auto_executed": len([r for r in auto_results if r.get("ok")]),
             "early_opportunities": len([c for c in constellations if c.stage in ("SCOUT", "STALKING")]),
             "top_score": alerts[0].shark_score if alerts else 0,
             "feed_status": reliability.system_status
@@ -258,6 +281,59 @@ class TradingPlatform:
 
     def vix_size_multiplier(self) -> float:
         return self.risk_intel.vix_size_multiplier()
+
+    # === V5.7 Decision Engine Accessors ===
+    def decisions_df(self) -> pd.DataFrame:
+        """Active decision queue (highest urgency/conviction first)."""
+        cols = ["id", "created_at", "symbol", "narrative", "action", "conviction",
+                "urgency", "side", "primary_driver", "constellation_pattern",
+                "constellation_stage", "velocity_context", "regime_context",
+                "auto_executable", "one_line"]
+        decisions = self.state.get("decisions", []) or []
+        if not decisions:
+            return pd.DataFrame(columns=cols)
+        df = pd.DataFrame(decisions)
+        for col in cols:
+            if col not in df.columns:
+                df[col] = None
+        return df[cols]
+
+    def decision_history_df(self) -> pd.DataFrame:
+        """Past executed/skipped decisions."""
+        cols = ["id", "created_at", "symbol", "action", "conviction", "urgency",
+                "executed", "executed_at", "skipped", "skipped_at", "one_line"]
+        history = self.state.get("decision_history", []) or []
+        if not history:
+            return pd.DataFrame(columns=cols)
+        df = pd.DataFrame(history)
+        for col in cols:
+            if col not in df.columns:
+                df[col] = None
+        return df[cols]
+
+    def decision_summary(self) -> Dict[str, Any]:
+        return self.state.get("decision_summary", {})
+
+    def get_decision(self, decision_id: str) -> Optional[Dict[str, Any]]:
+        """Full Decision object for a given ID (for detailed view)."""
+        for d in self.state.get("decisions", []) or []:
+            if d.get("id") == decision_id:
+                return d
+        for d in self.state.get("decision_history", []) or []:
+            if d.get("id") == decision_id:
+                return d
+        return None
+
+    def execute_decision(self, decision_id: str) -> Dict[str, Any]:
+        """User-driven manual execution. Works on paper or IBKR."""
+        return self.executor.execute(decision_id)
+
+    def skip_decision(self, decision_id: str) -> Dict[str, Any]:
+        return self.executor.skip(decision_id)
+
+    def is_auto_execute_active(self) -> bool:
+        """Is auto-execute currently active? Always False on IBKR."""
+        return self.executor.is_auto_execute_active()
 
     def settings(self) -> Dict[str, Any]:
         return self.state["settings"]

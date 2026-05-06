@@ -333,8 +333,170 @@ def render_risk_intelligence_tab(p: TradingPlatform) -> None:
         st.dataframe(sectors, width="stretch", hide_index=True)
 
 
+def conviction_badge(conviction: str) -> str:
+    return {
+        "HIGH": "🟢 HIGH",
+        "MEDIUM": "🟡 MEDIUM",
+        "LOW": "🟠 LOW",
+    }.get(conviction, conviction)
+
+
+def urgency_badge_decision(urgency: str) -> str:
+    return {
+        "ACT_NOW": "⚡ ACT NOW",
+        "TODAY": "📅 TODAY",
+        "THIS_WEEK": "🗓️ THIS WEEK",
+        "WATCH": "👁️ WATCH",
+    }.get(urgency, urgency)
+
+
+def action_emoji(action: str) -> str:
+    return {
+        "ENTER_NEW": "🆕",
+        "ADD_TO_EXISTING": "➕",
+        "AVERAGE_DOWN": "⬇️",
+        "TAKE_PARTIAL_PROFIT": "💰",
+        "REDUCE": "📉",
+        "EXIT_FULL": "🚪",
+        "AVOID": "🚫",
+        "WAIT": "⏸️",
+    }.get(action, "•")
+
+
+def render_decisions_tab(p: TradingPlatform) -> None:
+    """V5.7: Primary decision queue. The 'offload' surface."""
+    summary = p.decision_summary()
+    cols = st.columns(5)
+    cols[0].metric("Total", summary.get("total", 0))
+    cols[1].metric("⚡ ACT NOW", summary.get("by_urgency", {}).get("ACT_NOW", 0))
+    cols[2].metric("🟢 HIGH conviction", summary.get("by_conviction", {}).get("HIGH", 0))
+    cols[3].metric("🤖 Auto-eligible", summary.get("auto_executable", 0))
+    auto_status = "🟢 ACTIVE" if p.is_auto_execute_active() else "🔴 DISABLED"
+    cols[4].metric("Auto-Execute", auto_status)
+
+    backend = p.settings().get("broker_backend", "paper")
+    if backend == "ibkr":
+        st.warning("🛡️ IBKR mode: Auto-execute is HARDCODED OFF for real-money safety. Decisions still generate, but you must click Execute manually.")
+    elif p.is_auto_execute_active():
+        st.success("🤖 Paper auto-execute is ACTIVE. HIGH-conviction + ACT_NOW + entry/add/reduce/exit decisions will fire automatically on each scan.")
+    else:
+        st.info("Auto-execute is currently disabled. Toggle in Settings → V5.7 Decision Engine.")
+
+    decisions_df = p.decisions_df()
+    if decisions_df.empty:
+        st.info("No active decisions. Run a Shark Scan to populate.")
+        # Still show history
+        history = p.decision_history_df()
+        if not history.empty:
+            with st.expander(f"Decision History ({len(history)} past decisions)"):
+                st.dataframe(history.tail(50), width="stretch", hide_index=True)
+        return
+
+    # Filter
+    fc1, fc2, fc3 = st.columns(3)
+    urgency_filter = fc1.multiselect("Urgency", ["ACT_NOW", "TODAY", "THIS_WEEK", "WATCH"],
+                                      default=["ACT_NOW", "TODAY"])
+    conviction_filter = fc2.multiselect("Conviction", ["HIGH", "MEDIUM", "LOW"],
+                                         default=["HIGH", "MEDIUM"])
+    action_filter = fc3.multiselect("Action",
+                                     sorted(decisions_df["action"].dropna().unique()))
+
+    filtered = decisions_df.copy()
+    if urgency_filter:
+        filtered = filtered[filtered["urgency"].isin(urgency_filter)]
+    if conviction_filter:
+        filtered = filtered[filtered["conviction"].isin(conviction_filter)]
+    if action_filter:
+        filtered = filtered[filtered["action"].isin(action_filter)]
+
+    if filtered.empty:
+        st.info("No decisions match the selected filters.")
+        return
+
+    st.markdown("### Active Decisions")
+    for _, d in filtered.iterrows():
+        full_decision = p.get_decision(d.id)
+        if not full_decision:
+            continue
+
+        # Card
+        with st.container(border=True):
+            # Header row
+            h1, h2, h3, h4 = st.columns([3, 1, 1, 1])
+            ca_marker = " 🇨🇦" if is_canadian_symbol(d.symbol) else ""
+            auto_marker = " 🤖" if d.auto_executable else ""
+            h1.subheader(f"{action_emoji(d.action)} {d.action.replace('_', ' ')} — {d.symbol}{ca_marker}{auto_marker}")
+            h2.metric("Urgency", urgency_badge_decision(d.urgency))
+            h3.metric("Conviction", conviction_badge(d.conviction))
+            stage_str = f" [{d.constellation_stage}]" if d.constellation_stage else ""
+            h4.caption(f"⭐ {d.constellation_pattern}{stage_str}" if d.constellation_pattern else f"📊 {d.primary_driver}")
+
+            # The one-line summary - the offload surface
+            st.success(f"**{d.one_line}**")
+
+            # Plan + sizing details
+            sizing = full_decision.get("sizing", {}) or {}
+            plan = full_decision.get("plan", {}) or {}
+
+            pcol1, pcol2, pcol3, pcol4 = st.columns(4)
+            pcol1.metric("Suggested $", f"${sizing.get('suggested_dollars', 0):,.0f}",
+                          help=f"Base ${sizing.get('base_dollars', 0):,.0f} × VIX mult {sizing.get('vix_multiplier', 1):.2f}")
+            pcol2.metric("Quantity", f"{sizing.get('suggested_quantity', 0)}")
+            pcol3.metric("% Equity", f"{sizing.get('pct_of_equity', 0):.2f}%")
+            pcol4.metric("R:R Ratio", f"{plan.get('risk_reward_ratio', 0)}:1")
+
+            ecol1, ecol2, ecol3, ecol4 = st.columns(4)
+            ecol1.metric("Entry", f"${plan.get('entry_price', 0):.2f}",
+                          help=f"Zone: ${plan.get('entry_zone_low', 0):.2f} – ${plan.get('entry_zone_high', 0):.2f}")
+            ecol2.metric("Stop", f"${plan.get('stop_price', 0):.2f}",
+                          help=f"{plan.get('stop_pct_from_entry', 0):.1f}% from entry")
+            ecol3.metric("First Target", f"${plan.get('first_target', 0):.2f}",
+                          help=f"+{plan.get('target_pct_from_entry', 0):.1f}% from entry")
+            ecol4.metric("Trail Trigger", f"${plan.get('trail_trigger', 0):.2f}",
+                          help=f"Trailing stop activates at this price")
+
+            # Why
+            with st.expander("Why this decision"):
+                st.write(f"**Primary driver:** {d.primary_driver}")
+                st.write(f"**Confirming feeds:** {', '.join(d.confirming_feeds) if isinstance(d.confirming_feeds, list) else d.confirming_feeds}")
+                st.write(f"**Velocity:** {d.velocity_context}")
+                st.write(f"**Regime:** {d.regime_context}")
+                st.write(f"**Reasoning:** {full_decision.get('why', '')}")
+                if sizing.get("correlation_groups"):
+                    st.write(f"**Correlation groups:** {', '.join(sizing['correlation_groups'])}")
+                if sizing.get("headroom_remaining_pct", 0) > 0:
+                    st.write(f"**Headroom:** Up to {sizing['headroom_remaining_pct']:.1f}% more equity available if thesis confirms")
+
+            # Kill conditions
+            kill_conds = full_decision.get("kill_conditions", []) or []
+            if kill_conds:
+                with st.expander("⚠️ Kill conditions (when to exit/reverse)"):
+                    for kc in kill_conds:
+                        st.markdown(f"- {kc}")
+
+            # Action buttons
+            bcol1, bcol2, bcol3 = st.columns([1, 1, 4])
+            if bcol1.button(f"✓ Execute", key=f"exec_{d.id}", type="primary"):
+                res = p.execute_decision(d.id)
+                if res.get("ok"):
+                    st.success(f"Executed: {d.symbol} {d.action}")
+                    st.rerun()
+                else:
+                    st.error(f"Execution failed: {res.get('error', 'Unknown')}")
+            if bcol2.button(f"⊘ Skip", key=f"skip_{d.id}"):
+                p.skip_decision(d.id)
+                st.info(f"Skipped: {d.symbol}")
+                st.rerun()
+
+    # History at the bottom
+    history = p.decision_history_df()
+    if not history.empty:
+        with st.expander(f"Decision History ({len(history)} past decisions)"):
+            st.dataframe(history.tail(50).sort_values("created_at", ascending=False),
+                         width="stretch", hide_index=True)
+
+
 def render_settings_tab(p: TradingPlatform) -> None:
-    """V5.6.2: Full settings with V5.6 controls."""
     s = p.settings()
     st.subheader("All Settings")
 
@@ -395,9 +557,58 @@ def render_settings_tab(p: TradingPlatform) -> None:
             st.success("V5.6 risk settings saved")
             st.rerun()
 
+    with st.expander("🎯 V5.7 Decision Engine", expanded=True):
+        st.markdown("**Settings for the decision packager and auto-execute behavior:**")
+        backend = s.get("broker_backend", "paper")
+        if backend != "paper":
+            st.error("🛡️ Auto-execute is HARDCODED OFF for IBKR. Real-money execution always requires manual click. Switch to paper backend to enable auto-execute.")
+
+        v57_keys = ["decision_min_score", "decision_base_dollars", "decision_add_dollars",
+                    "decision_avg_down_dollars", "first_target_pct", "time_stop_days",
+                    "enable_average_down", "enable_auto_execute"]
+        st.json({k: s.get(k) for k in v57_keys})
+
+        st.markdown("---")
+        st.markdown("**Edit V5.7 Settings:**")
+        d1, d2 = st.columns(2)
+        new_dec_min_score = d1.slider("Decision min shark score", 50, 95,
+                                       int(s.get("decision_min_score", 65)))
+        new_dec_base = d2.number_input("Default $ for ENTER_NEW", min_value=100.0,
+                                        value=float(s.get("decision_base_dollars", 800)), step=100.0)
+        d3, d4 = st.columns(2)
+        new_dec_add = d3.number_input("Default $ for ADD", min_value=100.0,
+                                       value=float(s.get("decision_add_dollars", 400)), step=50.0)
+        new_dec_avg = d4.number_input("Default $ for AVERAGE_DOWN", min_value=100.0,
+                                       value=float(s.get("decision_avg_down_dollars", 400)), step=50.0)
+        d5, d6 = st.columns(2)
+        new_first_target = d5.slider("First profit target %", 3.0, 25.0,
+                                      float(s.get("first_target_pct", 0.08)) * 100, 0.5) / 100
+        new_time_stop = d6.slider("Time stop (days)", 3, 60, int(s.get("time_stop_days", 14)))
+        d7, d8 = st.columns(2)
+        new_avg_down = d7.checkbox("Enable AVERAGE_DOWN action",
+                                    value=bool(s.get("enable_average_down", True)),
+                                    help="If on, engine may suggest averaging down on positions 5-15% in the red when thesis reinforces. Max 1 average-down per position.")
+        new_auto_exec = d8.checkbox("Enable AUTO-EXECUTE (paper only)",
+                                     value=bool(s.get("enable_auto_execute", True)),
+                                     help="If on AND backend is paper, HIGH-conviction + ACT_NOW decisions auto-fire on each scan. HARDCODED OFF for IBKR.")
+
+        if st.button("Save V5.7 Decision Settings"):
+            p.update_settings({
+                "decision_min_score": new_dec_min_score,
+                "decision_base_dollars": new_dec_base,
+                "decision_add_dollars": new_dec_add,
+                "decision_avg_down_dollars": new_dec_avg,
+                "first_target_pct": new_first_target,
+                "time_stop_days": new_time_stop,
+                "enable_average_down": new_avg_down,
+                "enable_auto_execute": new_auto_exec,
+            })
+            st.success("V5.7 decision settings saved")
+            st.rerun()
+
 
 def main():
-    st.set_page_config(page_title="Signal Trading Platform V5.6.2", layout="wide")
+    st.set_page_config(page_title="Signal Trading Platform V5.7", layout="wide")
     p = TradingPlatform()
     s = p.settings()
 
@@ -409,8 +620,8 @@ def main():
     flash_banner(p)
     stop_alert_banner(p)
 
-    st.title("🦈 Signal Trading Platform V5.6.2 — Shark Radar Brain + Canadian Intelligence")
-    st.caption("Live-only intelligence · 24 feeds (5 Canadian) · 11 constellation patterns · Velocity tracking · Auto-stops · Correlation/sector caps · VIX-adjusted sizing · Full Strong Buy/Buy/REDUCE/Hold/Sell/Strong Sell spectrum")
+    st.title("🦈 Signal Trading Platform V5.7 — Decision Engine + Shark Radar Brain")
+    st.caption("🎯 Decision packages with auto-execute (paper) · 24 feeds (5 Canadian) · 11 constellation patterns · Velocity tracking · Auto-stops · Correlation/sector caps · VIX-adjusted sizing · Full action spectrum (ENTER/ADD/AVG_DOWN/PROFIT/REDUCE/EXIT)")
 
     with st.sidebar:
         st.header("Controls")
@@ -460,8 +671,9 @@ def main():
     rel = p.feed_reliability_report()
     risk_intel = p.risk_intelligence_summary()
     const_summary = p.constellation_summary()
+    dec_summary = p.decision_summary()
 
-    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+    c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(9)
     c1.metric("Equity", f"${status.get('equity', 0):,.2f}")
     c2.metric("Cash", f"${status.get('cash_balance', 0):,.2f}")
     c3.metric("Drawdown", f"{risk.get('drawdown_pct', 0):.2f}%")
@@ -470,15 +682,19 @@ def main():
     c6.metric("Flash", len(p.flash_alerts_df()[p.flash_alerts_df().get("acknowledged", pd.Series(dtype=bool)) != True]) if not p.flash_alerts_df().empty else 0)  # noqa: E712
     c7.metric("⭐ Patterns", const_summary.get("total_constellations", 0))
     c8.metric("🛑 Stops", risk_intel.get("stop_alerts_critical", 0) + risk_intel.get("stop_alerts_high", 0))
+    c9.metric("🎯 Decisions", dec_summary.get("total", 0))
 
     tabs = st.tabs([
-        "🚨 Flash", "🦈 Shark Alerts", "⭐ Constellations", "⚡ Velocity",
+        "🎯 Decisions", "🚨 Flash", "🦈 Shark Alerts", "⭐ Constellations", "⚡ Velocity",
         "🛡️ Risk Intelligence", "🇨🇦 Canada View", "Action Advice", "Risk",
         "Feed Reliability", "Signal Feed", "Feed Health", "Orders/Fills",
         "Positions", "Journal", "Settings"
     ])
 
     with tabs[0]:
+        render_decisions_tab(p)
+
+    with tabs[1]:
         st.subheader("Flash Alert Queue")
         flash = p.flash_alerts_df()
         if flash.empty:
@@ -495,7 +711,7 @@ def main():
             st.dataframe(hist.tail(100), width="stretch", hide_index=True)
         st.info("For always-on monitoring, run: python monitor.py --interval 60")
 
-    with tabs[1]:
+    with tabs[2]:
         alerts = p.alerts_df()
         if alerts.empty:
             st.info("Run a Shark Scan to populate the ranked opportunity queue.")
@@ -538,19 +754,19 @@ def main():
                         else:
                             st.error(res.get("error"))
 
-    with tabs[2]:
+    with tabs[3]:
         render_constellations_tab(p)
 
-    with tabs[3]:
+    with tabs[4]:
         render_velocity_tab(p)
 
-    with tabs[4]:
+    with tabs[5]:
         render_risk_intelligence_tab(p)
 
-    with tabs[5]:
+    with tabs[6]:
         render_canada_view(p)
 
-    with tabs[6]:
+    with tabs[7]:
         advice = p.advice_df()
         st.caption("Action scale: Strong Sell · Sell · REDUCE · Hold · Buy · Strong Buy. REDUCE fires when risk says trim rather than fully exit.")
         if advice.empty:
@@ -561,7 +777,7 @@ def main():
                 show["action"] = show["action"].astype(str).str.replace("_", " ")
             st.dataframe(show, width="stretch", hide_index=True)
 
-    with tabs[7]:
+    with tabs[8]:
         snap = p.risk_snapshot()
         cols = st.columns(5)
         cols[0].metric("Risk Status", snap.get("risk_status"))
@@ -573,11 +789,11 @@ def main():
             st.warning(" | ".join(snap.get("messages", [])))
         st.json(snap)
 
-    with tabs[8]:
+    with tabs[9]:
         st.json(rel)
         st.caption("LIVE_READY allows trade advice; SAFE_MODE still monitors but blocks trade-candidate promotion.")
 
-    with tabs[9]:
+    with tabs[10]:
         df = p.signals_df()
         if df.empty:
             st.info("No signals yet.")
@@ -613,14 +829,14 @@ def main():
                     show[col] = None
             st.dataframe(show[cols], width="stretch", hide_index=True)
 
-    with tabs[10]:
+    with tabs[11]:
         health = p.feed_health_df()
         if health.empty:
             st.info("No feed health yet. Run a live Shark Scan.")
         else:
             st.dataframe(health, width="stretch", hide_index=True)
 
-    with tabs[11]:
+    with tabs[12]:
         st.subheader("Orders")
         orders = p.orders_df()
         st.dataframe(orders, width="stretch", hide_index=True) if not orders.empty else st.info("No orders yet.")
@@ -628,14 +844,14 @@ def main():
         fills = p.fills_df()
         st.dataframe(fills, width="stretch", hide_index=True) if not fills.empty else st.info("No fills yet.")
 
-    with tabs[12]:
+    with tabs[13]:
         st.dataframe(p.positions_df(), width="stretch", hide_index=True)
 
-    with tabs[13]:
+    with tabs[14]:
         journal = p.journal_df().tail(250)
         st.dataframe(journal, width="stretch", hide_index=True) if not journal.empty else st.info("No journal entries yet.")
 
-    with tabs[14]:
+    with tabs[15]:
         render_settings_tab(p)
         st.info("Streamlit Community may sleep. For always-on monitoring, run: python monitor.py --interval 60")
 

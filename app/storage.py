@@ -55,6 +55,15 @@ DEFAULT_STATE: Dict[str, Any] = {
         "max_sector_pct": 0.30,          # Max 30% of equity in any one sector
         "vix_panic_threshold": 30,       # VIX above this triggers 50% size reduction
         "vix_elevated_threshold": 20,    # VIX above this triggers 25% size reduction
+        # === V5.7 Decision Engine settings ===
+        "decision_min_score": 65,           # Min shark score to generate a Decision
+        "decision_base_dollars": 800,       # Default dollars for ENTER_NEW
+        "decision_add_dollars": 400,        # Default dollars for ADD
+        "decision_avg_down_dollars": 400,   # Default dollars for AVERAGE_DOWN
+        "first_target_pct": 0.08,           # 8% first profit target
+        "time_stop_days": 14,               # Stale position exit
+        "enable_average_down": True,        # AVERAGE_DOWN active (paper test mode)
+        "enable_auto_execute": True,        # Auto-execute eligible decisions (PAPER ONLY enforced)
     },
     "signals": [],
     "alerts": [],
@@ -78,6 +87,11 @@ DEFAULT_STATE: Dict[str, Any] = {
     "sector_exposures": [],
     "risk_intelligence": {},
     "position_high_watermarks": {},
+    # V5.7 decision engine state
+    "decisions": [],
+    "decision_history": [],
+    "decision_summary": {},
+    "average_down_count": {},
 }
 
 class JsonStore:
