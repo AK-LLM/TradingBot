@@ -57,6 +57,8 @@ class TradingPlatform:
         self.save()
 
     def scan_signals(self, max_signals: int = 40, enabled_feeds: Optional[List[str]] = None) -> int:
+        # V5.7.1: Reset market data circuit breakers so each scan gets a fresh chance at the providers
+        MarketDataService.reset_circuit_breakers()
         signals, _health = collect_live_signals(self.state, max_per_feed=max(5, max_signals // 4), enabled_feeds=enabled_feeds)
         reliability = self.reliability.evaluate()
         signals_dicts = [s.to_dict() for s in signals]

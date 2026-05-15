@@ -87,6 +87,12 @@ DEFAULT_STATE: Dict[str, Any] = {
     "sector_exposures": [],
     "risk_intelligence": {},
     "position_high_watermarks": {},
+    # V5.5 intelligence state
+    "constellations": [],
+    "constellation_summary": {},
+    "velocity_history": {},
+    "velocity_readings": [],
+    "velocity_summary": {},
     # V5.7 decision engine state
     "decisions": [],
     "decision_history": [],

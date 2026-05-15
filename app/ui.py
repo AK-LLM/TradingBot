@@ -614,8 +614,14 @@ def main():
 
     if s.get("watchdog_enabled"):
         enable_auto_refresh(int(s.get("watchdog_interval_seconds", 60)))
-        result = p.watchdog_cycle(max_signals=int(s.get("watchdog_max_signals", 80)))
-        st.toast(f"Watchdog cycle: {result['signals']} signals, {result['new_flash_alerts']} new flash alert(s)")
+        try:
+            result = p.watchdog_cycle(max_signals=int(s.get("watchdog_max_signals", 80)))
+            if result.get("error"):
+                st.toast(f"⚠️ Watchdog cycle had errors: {result['error'][:80]}", icon="⚠️")
+            else:
+                st.toast(f"Watchdog cycle: {result['signals']} signals, {result['new_flash_alerts']} new flash alert(s)")
+        except Exception as e:
+            st.toast(f"⚠️ Watchdog crashed: {type(e).__name__}", icon="⚠️")
 
     flash_banner(p)
     stop_alert_banner(p)
@@ -627,14 +633,26 @@ def main():
         st.header("Controls")
         max_sigs = st.slider("Signals per scan", 10, 150, 60, 5)
         if st.button("Run Shark Scan", type="primary"):
-            n = p.scan_signals(max_sigs)
-            st.success(f"Collected {n} live signals and rebuilt the ranked queue")
+            try:
+                n = p.scan_signals(max_sigs)
+                st.success(f"Collected {n} live signals and rebuilt the ranked queue")
+            except Exception as e:
+                st.error(f"Scan failed: {type(e).__name__}: {str(e)[:200]}")
         if st.button("Run Watchdog Cycle Now"):
-            res = p.watchdog_cycle(max_signals=max_sigs)
-            st.success(f"Watchdog: {res['signals']} signals, {res['new_flash_alerts']} new flash alert(s)")
+            try:
+                res = p.watchdog_cycle(max_signals=max_sigs)
+                if res.get("error"):
+                    st.warning(f"Watchdog completed with errors: {res['error'][:120]}")
+                else:
+                    st.success(f"Watchdog: {res['signals']} signals, {res['new_flash_alerts']} new flash alert(s)")
+            except Exception as e:
+                st.error(f"Watchdog crashed: {type(e).__name__}: {str(e)[:200]}")
         if st.button("Morning Radar"):
-            n = p.morning_radar()
-            st.success(f"Morning radar collected {n} live signals")
+            try:
+                n = p.morning_radar()
+                st.success(f"Morning radar collected {n} live signals")
+            except Exception as e:
+                st.error(f"Morning radar failed: {type(e).__name__}: {str(e)[:200]}")
         if st.button("Mark-to-market"):
             p.status()
             st.success("Positions refreshed")

@@ -46,6 +46,10 @@ class SharkEngine:
                     tradability_scores.append(float(ctx["score"]))
                 except MarketDataError as e:
                     tradability_warnings.append(str(e))
+                except Exception as e:
+                    # V5.7.1: Catch ALL exceptions from market data — network errors, timeouts, etc.
+                    # Otherwise a single slow feed can crash the entire alert pipeline.
+                    tradability_warnings.append(f"Quote unavailable for {inst.get('symbol', '?')}: {type(e).__name__}")
             tradability = statistics.mean(tradability_scores) if tradability_scores else 0.0
             risk = max(10.0, min(100.0, 45.0 + statistics.pstdev(confs) * 90.0 - confirmation * 0.12 + (24.0 if len(sources) < 2 else 0.0)))
             sanity = self._sanity(rows, sources, feed_types, tradability, freshness)

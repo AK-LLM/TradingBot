@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 import os, csv, io, requests
 
 UA = os.getenv("SIGNAL_BOT_USER_AGENT", "signal-trading-platform-live contact:local")
-TIMEOUT = float(os.getenv("LIVE_FEED_TIMEOUT", "10"))
+TIMEOUT = float(os.getenv("LIVE_FEED_TIMEOUT", "5"))  # V5.7.1: shortened from 10s to 5s; many symbols compound
+QUOTE_TIMEOUT = float(os.getenv("QUOTE_TIMEOUT", "3"))  # V5.7.1: even shorter for quote calls (we have fallbacks)
 
 SYMBOL_TO_STOOQ = {
     "SPY":"spy.us", "QQQ":"qqq.us", "IWM":"iwm.us", "TLT":"tlt.us", "GLD":"gld.us", "SLV":"slv.us", "IAU":"iau.us", "SIVR":"sivr.us", "SGOL":"sgol.us", "GDX":"gdx.us", "SIL":"sil.us",
@@ -17,10 +18,22 @@ class MarketDataError(Exception):
     pass
 
 class MarketDataService:
+    # V5.7.1: Class-level circuit breaker — if Stooq fails N times in this process,
+    # stop calling it for the rest of the scan to prevent compounding timeouts.
+    _stooq_failures = 0
+    _tradier_failures = 0
+    CIRCUIT_BREAKER_THRESHOLD = 5
+
     def __init__(self, state: Dict[str, Any]):
         self.state = state
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": UA, "Accept":"application/json,text/csv,*/*"})
+
+    @classmethod
+    def reset_circuit_breakers(cls):
+        """Called at start of each scan to give services a fresh chance."""
+        cls._stooq_failures = 0
+        cls._tradier_failures = 0
 
     def quote(self, symbol: str) -> Dict[str, Any]:
         symbol = symbol.upper()
@@ -50,14 +63,21 @@ class MarketDataService:
         return {"score": round(score, 1), "quote": q, "trend_ok": trend_ok, "chase_penalty": late_penalty}
 
     def _tradier_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if MarketDataService._tradier_failures >= self.CIRCUIT_BREAKER_THRESHOLD:
+            return None
         token = os.getenv("TRADIER_TOKEN")
         if not token:
             return None
         base = os.getenv("TRADIER_BASE_URL", "https://api.tradier.com/v1")
-        r = self.session.get(f"{base}/markets/quotes", params={"symbols": symbol, "greeks":"false"}, headers={"Authorization": f"Bearer {token}", "Accept":"application/json"}, timeout=TIMEOUT)
-        if r.status_code >= 400:
+        try:
+            r = self.session.get(f"{base}/markets/quotes", params={"symbols": symbol, "greeks":"false"}, headers={"Authorization": f"Bearer {token}", "Accept":"application/json"}, timeout=QUOTE_TIMEOUT)
+            if r.status_code >= 400:
+                MarketDataService._tradier_failures += 1
+                return None
+            data = r.json()
+        except (requests.exceptions.RequestException, ValueError, Exception):
+            MarketDataService._tradier_failures += 1
             return None
-        data = r.json()
         quote = data.get("quotes", {}).get("quote") if isinstance(data, dict) else None
         if isinstance(quote, list):
             quote = quote[0] if quote else None
@@ -76,13 +96,25 @@ class MarketDataService:
         return {"symbol":symbol, "last":round(last,4), "bid":round(bid,4), "ask":round(ask,4), "spread_bps":round(spread_bps,1), "volume":as_float(quote.get("volume")), "change_pct":round(chg,3), "source":"tradier", "ts":datetime.now(timezone.utc).isoformat()}
 
     def _stooq_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        # Circuit breaker: skip if Stooq has been failing this scan
+        if MarketDataService._stooq_failures >= self.CIRCUIT_BREAKER_THRESHOLD:
+            return None
         code = SYMBOL_TO_STOOQ.get(symbol)
         if not code:
             return None
-        r = self.session.get(f"https://stooq.com/q/l/?s={code}&f=sd2t2ohlcv&h&e=csv", timeout=TIMEOUT)
-        if r.status_code >= 400:
+        try:
+            r = self.session.get(f"https://stooq.com/q/l/?s={code}&f=sd2t2ohlcv&h&e=csv", timeout=QUOTE_TIMEOUT)
+            if r.status_code >= 400:
+                MarketDataService._stooq_failures += 1
+                return None
+            text = r.text
+        except (requests.exceptions.RequestException, Exception):
+            MarketDataService._stooq_failures += 1
             return None
-        rows = list(csv.DictReader(io.StringIO(r.text)))
+        try:
+            rows = list(csv.DictReader(io.StringIO(text)))
+        except Exception:
+            return None
         if not rows:
             return None
         row = rows[0]
