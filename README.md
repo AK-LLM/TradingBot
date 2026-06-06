@@ -4,7 +4,8 @@ The Decision Engine + Critic + Calibration Loop release. Builds on the V5.x
 shark-radar foundation with an adversarial critic on every constellation,
 explicit probability bands on every Decision, an active two-way bridge to the
 Risk Oracle suite, and a multi-timeframe TA matrix that mirrors Lewis
-Jackson's MAX indicator stack in pure Python (no TradingView subscription).
+Jackson's MAX indicator stack in pure Python (Stooq free OHLCV + hand-rolled
+indicators — no TradingView subscription, no pandas-ta, no yfinance).
 
 ## What's in V6.1 (this release)
 
@@ -63,10 +64,9 @@ METACULUS_TOKEN=
 # V6.0 additions
 WHALE_ALERT_API_KEY=        # optional; on-chain whale collector falls back gracefully
 
-# V6.1 TA matrix tuning (all optional)
+# V6.1 TA matrix tuning (all optional, no key needed — uses Stooq)
 TA_MATRIX_SYMBOLS=          # comma list, defaults to your held + recently-alerted symbols
 TA_MATRIX_MAX_SYMBOLS=10
-TA_MATRIX_HISTORY_DAYS=180
 
 SIGNAL_BOT_USER_AGENT=signal-trading-platform/6.1 contact:your_email@example.com
 SEC_USER_AGENT=signal-trading-platform/6.1 contact:your_email@example.com
