@@ -26,6 +26,10 @@ from app.lewis_feeds import collect_all_lewis_feeds
 from app.target_drift import compute_drift_signal
 from app.dispatch import dispatch_pending_decisions
 from app.risk_oracle_bridge import read_category_priors, bridge_status
+# V6.1 cross-check + calibration + TA matrix
+from app.critic_engine import critique_all, critique_summary
+from app.calibration_writeback import writeback_closed_decisions, writeback_status
+from app.ta_matrix import compute_ta_matrix_signals, ta_matrix_status
 
 class TradingPlatform:
     def __init__(self, store_path: str = "data/state.json") -> None:
@@ -74,6 +78,11 @@ class TradingPlatform:
             signals.extend(collect_all_lewis_feeds(self.state))
         except Exception:
             pass
+        # === V6.1: TA matrix (multi-timeframe pandas-ta confluence) ===
+        try:
+            signals.extend(compute_ta_matrix_signals(self.state))
+        except Exception:
+            pass
         # Portfolio target-allocation drift (Janet equivalent). One signal/scan.
         try:
             drift_sig = compute_drift_signal(self.state)
@@ -105,6 +114,16 @@ class TradingPlatform:
         # 2. Detect constellations BEFORE alert generation so intelligence engine sees them
         constellations = self.constellations.detect_all(signals_dicts, velocity_readings)
         self.state["constellations"] = [c.to_dict() for c in constellations]
+
+        # === V6.1: Run adversarial critic on each constellation. Mutates the
+        # constellation dicts in state["constellations"] in place, lowering
+        # confidence where the critic disagrees. ===
+        try:
+            critique_all(self.state)
+            self.state["constellation_critique_summary"] = critique_summary(self.state)
+        except Exception:
+            pass
+
         self.state["constellation_summary"] = summarize_constellations(self.state, constellations)
 
         # 3. Mark positions to market and run risk intelligence BEFORE alert generation
@@ -147,6 +166,20 @@ class TradingPlatform:
                     "event": "dispatch_pass",
                     "sent": sum(1 for r in dispatch_results if r.get("email_sent") or r.get("telegram_sent")),
                     "details": dispatch_results,
+                })
+        except Exception:
+            pass
+
+        # 7c. V6.1: Calibration writeback — push closed decisions into
+        # Risk Oracle's predictions table so its Brier loop scores STP's
+        # track record. Idempotent; cheap when nothing to write.
+        try:
+            wb = writeback_closed_decisions(self.state)
+            if wb.get("written", 0) > 0:
+                self.state.setdefault("journal", []).append({
+                    "ts": now_iso(),
+                    "event": "calibration_writeback",
+                    **wb,
                 })
         except Exception:
             pass
@@ -246,6 +279,16 @@ class TradingPlatform:
 
     def risk_oracle_priors(self) -> Dict[str, Any]:
         return self.state.get("risk_oracle_priors", {}) or {}
+
+    # === V6.1 Critic + Calibration + TA Matrix accessors ===
+    def critic_summary(self) -> Dict[str, Any]:
+        return self.state.get("constellation_critique_summary", {}) or {}
+
+    def writeback_status(self) -> Dict[str, Any]:
+        return writeback_status()
+
+    def ta_matrix_status(self) -> Dict[str, Any]:
+        return ta_matrix_status()
 
     def signals_df(self) -> pd.DataFrame:
         cols = ["id", "created_at", "source", "symbol", "direction", "confidence", "magnitude", "title", "description", "horizon", "metadata"]

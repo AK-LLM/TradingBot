@@ -5,3 +5,8 @@ ib_insync>=0.9.86
 # V4 live public collectors use requests + stdlib XML/CSV parsing.
 # V5.4 extended feeds: pytrends is optional; google_trends will fall back to RSS if not installed
 pytrends>=4.9.0  # optional for richer Google Trends signal
+# V6.1: TA matrix module needs pandas-ta + yfinance. Both are soft deps —
+# if absent, the ta_matrix collector returns [] gracefully.
+pandas-ta>=0.3.14b0
+yfinance>=0.2.40
+

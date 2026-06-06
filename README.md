@@ -1,17 +1,48 @@
-# Signal Trading Platform — V5.3 Live Feed Patch
+# Signal Trading Platform — V6.1
 
-This build keeps the original shark-radar concept intact while cleaning up live feed behavior.
+The Decision Engine + Critic + Calibration Loop release. Builds on the V5.x
+shark-radar foundation with an adversarial critic on every constellation,
+explicit probability bands on every Decision, an active two-way bridge to the
+Risk Oracle suite, and a multi-timeframe TA matrix that mirrors Lewis
+Jackson's MAX indicator stack in pure Python (no TradingView subscription).
 
-## What changed in V5.3
+## What's in V6.1 (this release)
 
-- Kalshi and Tradier are **kept in the suite** for later use.
-- Missing Tradier/Kalshi credentials are now treated meaningfully, not as broken bot logic.
-- Manifold endpoint was fixed to avoid the bad request caused by fragile sort parameters.
-- SEC now sends a proper User-Agent and falls back to the SEC current-filings Atom feed if the company ticker endpoint is blocked.
-- News RSS now skips malformed feeds instead of failing the whole news collector.
-- Binance 451/region blocking is handled by falling back to Kraken and CoinGecko.
-- Feed Reliability now distinguishes runtime errors from credential/access/geo limitations.
-- Polygon/Massive remains the default options-flow provider.
+- **`app/critic_engine.py`** — adversarial counter-check on each detected
+  constellation. Pattern-specific critics (Smart Money Positioning, Distribution
+  Pattern, Narrative Ignition, Geopolitical Cascade, Insider Cluster, Euphoria
+  Top, Crowded Long Warning, Sentiment Capitulation) each ask "what would
+  make this signal wrong?" and adjust confidence + widen the uncertainty band
+  if disagreement is found.
+- **`app/calibration_writeback.py`** — closes the loop. Every closed Decision
+  is written back to Risk Oracle's `predictions` table so its Brier-scoring
+  calibration loop measures STP's actual track record per-narrative,
+  per-constellation, per-conviction.
+- **`app/ta_matrix.py`** — the 21-indicator × 6-timeframe matrix in Python
+  (pandas-ta + yfinance). Emits Signals at confluence > 65%; constellation
+  engine groups multi-timeframe agreements as a new `TA Confluence` pattern.
+- **Active Risk Oracle bridge wiring** — `decision_engine._calculate_sizing()`
+  now calls `risk_oracle_bridge.reconcile_decision()` and multiplies suggested
+  dollars by the RO sizing multiplier. High tail risk on the matching RO
+  category downgrades urgency from ACT_NOW to TODAY.
+- **Probability bands on Decisions** — `Decision.point_p`, `band_low`,
+  `band_high`. Replaces the implicit shark_score → conviction mapping;
+  enables real Kelly sizing in IBKR-live mode.
+
+## What V6.0 added (still in this build)
+
+- **`app/lewis_feeds.py`** — six new public collectors:
+  filtered Form 4 insider buys, 13F fund-delta tracking, on-chain whale
+  transfers (CEX↔private), Fed-speech NLP tilt, STOCK Act stub, and 13D/13G
+  activist stakes.
+- **`app/target_drift.py`** — Janet equivalent. Compares current portfolio
+  vs `config/portfolio_target.json`; emits a single drift signal per scan.
+- **`app/dispatch.py`** — email + Telegram delivery for high-conviction
+  decisions. Idempotent via local dispatch ledger.
+- **`app/risk_oracle_bridge.py`** — bidirectional bridge to the Risk Oracle
+  suite. V6.1 makes its `reconcile_decision()` function actually load-bearing.
+- **`install/`** — OS-native schedulers (macOS launchd, Linux systemd-user /
+  crontab fallback, Windows Task Scheduler) for running the platform headless.
 
 ## Setup
 
@@ -29,11 +60,47 @@ KALSHI_API_SECRET=
 MARKETDATA_API_TOKEN=
 METACULUS_TOKEN=
 
-SIGNAL_BOT_USER_AGENT=signal-trading-platform/5.3 contact:your_email@example.com
-SEC_USER_AGENT=signal-trading-platform/5.3 contact:your_email@example.com
+# V6.0 additions
+WHALE_ALERT_API_KEY=        # optional; on-chain whale collector falls back gracefully
+
+# V6.1 TA matrix tuning (all optional)
+TA_MATRIX_SYMBOLS=          # comma list, defaults to your held + recently-alerted symbols
+TA_MATRIX_MAX_SYMBOLS=10
+TA_MATRIX_HISTORY_DAYS=180
+
+SIGNAL_BOT_USER_AGENT=signal-trading-platform/6.1 contact:your_email@example.com
+SEC_USER_AGENT=signal-trading-platform/6.1 contact:your_email@example.com
 ```
 
 Do **not** commit `.env` to GitHub.
+
+## Run
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+## Run as a background service
+
+```bash
+# macOS
+bash install/schedule_mac.sh
+
+# Linux
+bash install/schedule_linux.sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -File install\schedule_windows.ps1
+```
+
+## Action advice
+
+Decisions still come out as one of:
+**ENTER_NEW, ADD, AVERAGE_DOWN, HOLD, TAKE_PARTIAL_PROFIT, REDUCE, EXIT_FULL,
+WAIT, AVOID** — with conviction (HIGH/MEDIUM/LOW), urgency (ACT_NOW/TODAY/
+THIS_WEEK/WATCH), and a sizing block. V6.1 adds explicit probability + band
+so you can size with real Kelly when live.
 
 ## Feed status meanings
 
@@ -46,45 +113,11 @@ Do **not** commit `.env` to GitHub.
 | `geo_blocked` | Provider is unavailable in your region; fallback is attempted where available. |
 | `error` | Runtime error that needs attention. |
 
-## Run UI
+## Per-version upgrade notes
 
-```bash
-pip install -r requirements.txt
-streamlit run streamlit_app.py
-```
-
-## Run local watchdog
-
-```bash
-python monitor.py --interval 60
-```
-
-## Active confirmation pool
-
-The system looks for confirmation across feed categories, not just individual providers:
-
-- Prediction/probability: Polymarket, PredictIt, Manifold, Kalshi, Metaculus when available
-- Options/positioning: Polygon, MarketData.app, Tradier when configured
-- Market movement: Stooq
-- Crypto movement: Binance if available, otherwise Kraken/CoinGecko fallback
-- News/macro: RSS/news collector
-- Filings/positioning: SEC and CFTC
-
-Action advice remains: **Strong Buy, Buy, Hold, Sell, Strong Sell**.
-
-## V5.4 macro/event intelligence expansion
-
-This build adds location-neutral public collectors. They are wired as live collectors and do not require brokerage access.
-
-| Feed | Category | Purpose |
-|---|---|---|
-| GDELT Global Events | News/event | Global event pressure: geopolitics, sanctions, energy, drought, grid, shipping. |
-| FRED Macro Pulse | Macro data | Rates, dollar, credit, inflation/liquidity backdrop. |
-| Treasury Yield Pulse | Rates | Yield-curve and bond-market stress/relief. |
-| EIA Energy Pulse | Energy data/news | Oil, natural gas, electricity, inventories, power demand headlines. |
-| NOAA Weather/Drought Alerts | Weather | Heat, storm, drought/flood stress for energy, water, grid and cooling themes. |
-| Power Grid Pulse | Power grid | Electricity/grid demand and reliability news. |
-| Shipping/Supply Chain Events | Supply chain | Shipping, tanker, port, canal and supply-chain disruption signals. |
-| Bank of Canada Macro | Canada macro | Canada-relevant FX/rate/macro observations via public Valet data. |
-
-These feeds strengthen confirmation without changing the core rule: **2 confirmations from different feed categories + sanity checks before action advice.**
+Each release ships a focused upgrade-notes file:
+- `UPGRADE_NOTES_V5.4.md` — macro/event intelligence expansion
+- `UPGRADE_NOTES_V5.5.md` — velocity tracker + intelligence engine
+- `UPGRADE_NOTES_V5.6.md` — risk intelligence + sell-side constellations
+- `UPGRADE_NOTES_V6.0.md` — Lewis-derived feeds + Risk Oracle bridge + dispatch
+- `UPGRADE_NOTES_V6.1.md` — critic + bands + active bridge + calibration loop + TA matrix

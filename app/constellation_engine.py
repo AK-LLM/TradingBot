@@ -24,7 +24,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 # Lifecycle stages
@@ -133,6 +133,8 @@ class ConstellationEngine:
             constellations.extend(self._detect_distribution_pattern(narrative, narrative_signals, velocity_map))
             constellations.extend(self._detect_euphoria_top(narrative, narrative_signals, velocity_map))
             constellations.extend(self._detect_crowded_long_warning(narrative, narrative_signals, velocity_map))
+            # === V6.1 TA confluence pattern ===
+            constellations.extend(self._detect_ta_confluence(narrative, narrative_signals, velocity_map))
 
         # Sort by stage priority (SCOUT first - those are the early ones we care about most)
         # then by confidence within stage
@@ -741,6 +743,80 @@ class ConstellationEngine:
                 "suggested_action": "REDUCE",  # Hint to intelligence engine
             }
         )]
+
+    def _detect_ta_confluence(self, narrative: str, signals: List[Dict[str, Any]],
+                                velocity_map: Dict[str, Any]) -> List[Constellation]:
+        """V6.1 TA Confluence Pattern.
+
+        Pattern: multiple timeframes of the 21-indicator TA matrix agree on
+        the same direction for the same symbol. Triggered by ta_matrix.py
+        signals. We require ≥2 timeframes pointing the same way before
+        firing (single-TF agreement isn't multi-frame confluence).
+
+        Stage progression:
+          SCOUT     — 2 timeframes agree
+          STALKING  — 3 timeframes agree
+          STRIKING  — 4+ timeframes agree
+        """
+        ta_signals = [s for s in signals
+                      if (s.get("metadata", {}) or {}).get("feed_type") == "technical_analysis"]
+        if not ta_signals:
+            return []
+
+        # Group by (symbol, direction)
+        from collections import defaultdict as _dd
+        groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = _dd(list)
+        for s in ta_signals:
+            key = (s.get("symbol", ""), s.get("direction", ""))
+            groups[key].append(s)
+
+        out: List[Constellation] = []
+        for (symbol, direction), group in groups.items():
+            tfs = sorted({(g.get("metadata", {}) or {}).get("timeframe", "") for g in group})
+            tfs = [t for t in tfs if t]
+            n_tfs = len(tfs)
+            if n_tfs < 2:
+                continue
+
+            if n_tfs >= 4:
+                stage = STAGE_STRIKING
+                confidence = 0.80
+            elif n_tfs == 3:
+                stage = STAGE_STALKING
+                confidence = 0.65
+            else:
+                stage = STAGE_SCOUT
+                confidence = 0.55
+
+            avg_score = sum(abs(float((g.get("metadata", {}) or {}).get("confluence_score", 0)))
+                            for g in group) / len(group)
+
+            out.append(Constellation(
+                pattern_name="TA Confluence",
+                stage=stage,
+                confidence=round(confidence, 2),
+                direction=direction,
+                primary_narrative="ta_confluence",
+                primary_symbol=symbol,
+                contributing_feeds=["ta_matrix"],
+                contributing_signal_ids=[s.get("id", "") for s in group],
+                description=(
+                    f"TA matrix shows {direction} confluence on {symbol} across "
+                    f"{n_tfs} timeframes ({', '.join(tfs)}). Average indicator agreement: "
+                    f"{avg_score*100:.0f}%."
+                ),
+                why_it_matters=(
+                    "Multi-timeframe TA agreement is high-information when it lines up "
+                    "with other low-noise feeds (filings, options, regulatory). Treat as "
+                    "a confirming signal — not a standalone entry."
+                ),
+                metadata={
+                    "timeframes_agreeing": tfs,
+                    "n_timeframes": n_tfs,
+                    "avg_confluence_score": round(avg_score, 3),
+                },
+            ))
+        return out
 
 
 def summarize_constellations(state: Dict[str, Any], constellations: List[Constellation]) -> Dict[str, Any]:

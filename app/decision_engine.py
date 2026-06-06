@@ -125,6 +125,17 @@ class Decision:
     executed_at: str = ""
     skipped: bool = False        # User dismissed?
     skipped_at: str = ""
+    # V6.1: explicit probability + uncertainty band, replacing the implicit
+    # shark_score → conviction mapping. Used for Kelly sizing and for writeback
+    # to Risk Oracle's calibration store.
+    point_p: float = 0.5          # estimated probability the thesis pays off
+    band_low: float = 0.35        # lower bound of uncertainty band
+    band_high: float = 0.65       # upper bound
+    critic_verdict: str = "no_opinion"   # agrees / disagrees / no_opinion
+    risk_oracle_category: str = ""        # mapped RO category if a forecast applies
+    risk_oracle_point_p: float = 0.0     # RO's forecast point_p, if any
+    risk_oracle_band_width: float = 0.0  # RO's band width, if any
+    risk_oracle_sizing_mult: float = 1.0 # final sizing multiplier applied from RO bridge
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -199,12 +210,37 @@ class DecisionEngine:
     # ------------------------------------------------------------------
 
     def _calculate_sizing(self, symbol: str, price: float, base_dollars: float,
-                          existing_position: Optional[Dict[str, Any]] = None) -> DecisionSizing:
-        """Auto-size with VIX adjustment and correlation check."""
+                          existing_position: Optional[Dict[str, Any]] = None,
+                          narrative: str = "") -> DecisionSizing:
+        """Auto-size with VIX adjustment, correlation check, and (V6.1) Risk
+        Oracle reconciliation."""
         from app.risk_intelligence import RiskIntelligence
         ri = RiskIntelligence(self.state)
         vix_mult = ri.vix_size_multiplier()
         adjusted_dollars = base_dollars * vix_mult
+
+        # V6.1: Risk Oracle reconciliation. If a matching forecast exists,
+        # multiply by its sizing_multiplier and capture metadata for the Decision.
+        ro_mult = 1.0
+        ro_meta: Dict[str, Any] = {"has_forecast": False}
+        try:
+            from app.risk_oracle_bridge import reconcile_decision
+            note = reconcile_decision({"narrative": narrative, "symbol": symbol})
+            if note.has_forecast:
+                ro_mult = note.sizing_multiplier
+                ro_meta = {
+                    "has_forecast": True,
+                    "category": note.category,
+                    "point_p": note.point_p,
+                    "band_width": note.band_width,
+                    "sizing_multiplier": ro_mult,
+                    "high_tail_risk": note.high_tail_risk,
+                    "notes": note.notes,
+                }
+                adjusted_dollars *= ro_mult
+        except Exception:
+            pass  # bridge unavailable; degrade silently
+
         # Cap at cash available
         cash = float(self.state.get("settings", {}).get("cash_balance", 0))
         if adjusted_dollars > cash * 0.95:  # Leave 5% buffer
@@ -225,7 +261,7 @@ class DecisionEngine:
         headroom = max(0, max_position_value - existing_value - actual_dollars)
         headroom_pct = (headroom / equity) * 100 if equity > 0 else 0
 
-        return DecisionSizing(
+        sizing = DecisionSizing(
             suggested_dollars=round(actual_dollars, 2),
             suggested_quantity=suggested_qty,
             pct_of_equity=round((actual_dollars / equity) * 100, 2),
@@ -236,6 +272,9 @@ class DecisionEngine:
             correlation_note=corr_check.get("reason", "Approved"),
             headroom_remaining_pct=round(headroom_pct, 2),
         )
+        # Stash RO meta as a sidecar attr so build_decisions can read it
+        sizing._ro_meta = ro_meta  # type: ignore[attr-defined]
+        return sizing
 
     # ------------------------------------------------------------------
     # Plan calculation (entry/stop/target/trail/time stop)
@@ -526,7 +565,8 @@ class DecisionEngine:
 
             # Sizing (skip for AVOID)
             if action != ACTION_AVOID:
-                sizing = self._calculate_sizing(symbol, price, base_dollars, existing)
+                sizing = self._calculate_sizing(symbol, price, base_dollars, existing,
+                                                narrative=alert.get("narrative", ""))
                 # If correlation rejected, downgrade to WAIT
                 if not sizing.correlation_approved and action in (ACTION_ENTER_NEW, ACTION_ADD, ACTION_AVG_DOWN):
                     action = ACTION_WAIT
@@ -571,6 +611,38 @@ class DecisionEngine:
 
             one_line = self._build_one_line(action, sizing, plan, symbol, constellation, existing)
 
+            # === V6.1: Probability + band on the Decision ===
+            # point_p is derived from shark_score (0-100 → 0-1), with constellation
+            # confidence as a refinement. band starts at ±15pp and widens based on
+            # critic disagreement and Risk Oracle band width if present.
+            score = float(alert.get("shark_score", 0)) / 100.0
+            point_p = max(0.05, min(0.95, score))
+            band_half = 0.15
+
+            # Critic widens band if it disagreed on the underlying constellation
+            critic_verdict = "no_opinion"
+            if constellation:
+                critic_verdict = str(constellation.get("critic_verdict", "no_opinion"))
+                widening = float(constellation.get("critic_band_widening", 0.0))
+                band_half += widening
+
+            # RO meta (set by _calculate_sizing as a sidecar attribute)
+            ro_meta = getattr(sizing, "_ro_meta", {"has_forecast": False}) or {"has_forecast": False}
+            ro_sizing_mult = float(ro_meta.get("sizing_multiplier", 1.0))
+            ro_category = str(ro_meta.get("category", "") or "")
+            ro_point_p = float(ro_meta.get("point_p") or 0.0)
+            ro_band_width = float(ro_meta.get("band_width") or 0.0)
+            # If we have a RO forecast, also blend its band width into ours
+            if ro_meta.get("has_forecast"):
+                band_half = max(band_half, ro_band_width / 2.0)
+
+            band_low = max(0.0, point_p - band_half)
+            band_high = min(1.0, point_p + band_half)
+
+            # If RO flags high tail risk, downgrade urgency
+            if ro_meta.get("high_tail_risk") and urgency == URGENCY_ACT_NOW:
+                urgency = URGENCY_TODAY
+
             # Auto-executable? (paper trades only; aggressive mode for ENTER_NEW + ADD only)
             auto_exec = False
             if (self._setting("enable_auto_execute", False)
@@ -602,6 +674,15 @@ class DecisionEngine:
                 constellation_pattern=(constellation.get("pattern_name", "") if constellation else ""),
                 constellation_stage=(constellation.get("stage", "") if constellation else ""),
                 auto_executable=auto_exec,
+                # V6.1 additions
+                point_p=round(point_p, 3),
+                band_low=round(band_low, 3),
+                band_high=round(band_high, 3),
+                critic_verdict=critic_verdict,
+                risk_oracle_category=ro_category,
+                risk_oracle_point_p=round(ro_point_p, 3),
+                risk_oracle_band_width=round(ro_band_width, 3),
+                risk_oracle_sizing_mult=round(ro_sizing_mult, 3),
             )
             decisions.append(decision)
 

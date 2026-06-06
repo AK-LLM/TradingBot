@@ -608,7 +608,7 @@ def render_settings_tab(p: TradingPlatform) -> None:
 
 
 def main():
-    st.set_page_config(page_title="Signal Trading Platform V5.8", layout="wide")
+    st.set_page_config(page_title="Signal Trading Platform V6.1", layout="wide")
     p = TradingPlatform()
     s = p.settings()
 
@@ -626,7 +626,7 @@ def main():
     flash_banner(p)
     stop_alert_banner(p)
 
-    st.title("🦈 Signal Trading Platform V5.8 — Shark Radar Sniffer + Decision Engine")
+    st.title("🦈 Signal Trading Platform V6.1 — Decision Engine + Critic + Calibration Loop")
     st.caption("🦈 34 feeds (10 sniffer feeds for front-running) · Decision packages with auto-execute (paper) · 11 constellation patterns · Velocity tracking · Auto-stops · Correlation/sector caps · VIX-adjusted sizing · Full action spectrum")
 
     with st.sidebar:
