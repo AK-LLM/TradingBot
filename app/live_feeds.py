@@ -57,6 +57,17 @@ LIVE_FEEDS: Dict[str, FeedConfig] = {
     "volatility_regime": FeedConfig("volatility_regime", "Volatility Regime (VIX/Credit)", "regime_context", []),
     "google_trends": FeedConfig("google_trends", "Google Trends Attention", "attention", []),
     "reddit_sentiment": FeedConfig("reddit_sentiment", "Reddit Crowd Sentiment", "crowd_sentiment", []),
+    # === V5.8 Sniffer Feeds ===
+    "fred_leading": FeedConfig("fred_leading", "FRED Leading Indices", "macro_data", []),
+    "treasury_liquidity": FeedConfig("treasury_liquidity", "Treasury Liquidity Pulse", "macro_data", []),
+    "credit_spreads": FeedConfig("credit_spreads", "Credit Spreads Pulse", "macro_data", []),
+    "ecb_macro": FeedConfig("ecb_macro", "ECB Statistical Data", "macro_data", []),
+    "boj_yen_carry": FeedConfig("boj_yen_carry", "Yen Carry Trade Monitor", "macro_data", []),
+    "sec_8k": FeedConfig("sec_8k", "SEC 8-K Material Events", "filings", []),
+    "openinsider_cluster": FeedConfig("openinsider_cluster", "OpenInsider Cluster Buys", "filings", []),
+    "short_reports": FeedConfig("short_reports", "Short Seller Reports", "news", []),
+    "wikipedia_attention": FeedConfig("wikipedia_attention", "Wikipedia Attention Anomaly", "attention", []),
+    "usaspending_contracts": FeedConfig("usaspending_contracts", "Federal Contract Awards", "filings", []),
 }
 
 class FeedAccessLimited(Exception):
@@ -102,6 +113,17 @@ class LiveFeedCollector:
             "volatility_regime": self._extended("volatility_regime"),
             "google_trends": self._extended("google_trends"),
             "reddit_sentiment": self._extended("reddit_sentiment"),
+            # === V5.8 Sniffer Feeds (delegated to sniffer_feeds module) ===
+            "fred_leading": self._sniffer("fred_leading"),
+            "treasury_liquidity": self._sniffer("treasury_liquidity"),
+            "credit_spreads": self._sniffer("credit_spreads"),
+            "ecb_macro": self._sniffer("ecb_macro"),
+            "boj_yen_carry": self._sniffer("boj_yen_carry"),
+            "sec_8k": self._sniffer("sec_8k"),
+            "openinsider_cluster": self._sniffer("openinsider_cluster"),
+            "short_reports": self._sniffer("short_reports"),
+            "wikipedia_attention": self._sniffer("wikipedia_attention"),
+            "usaspending_contracts": self._sniffer("usaspending_contracts"),
         }
         for key in keys:
             cfg = LIVE_FEEDS.get(key)
@@ -147,6 +169,16 @@ class LiveFeedCollector:
         from app.extended_feeds import EXTENDED_COLLECTORS
         def _runner(max_per_feed: int = 25):
             collector = EXTENDED_COLLECTORS.get(key)
+            if collector is None:
+                return []
+            return collector(max_per_feed=max_per_feed)
+        return _runner
+
+    def _sniffer(self, key: str):
+        """Dispatcher to V5.8 sniffer feeds module. Returns a callable matching the collector signature."""
+        from app.sniffer_feeds import SNIFFER_COLLECTORS
+        def _runner(max_per_feed: int = 25):
+            collector = SNIFFER_COLLECTORS.get(key)
             if collector is None:
                 return []
             return collector(max_per_feed=max_per_feed)

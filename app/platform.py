@@ -21,6 +21,11 @@ from app.risk_intelligence import RiskIntelligence
 # V5.7 Decision Engine + Executor
 from app.decision_engine import DecisionEngine
 from app.decision_executor import DecisionExecutor
+# V6.0 Lewis-derived additions
+from app.lewis_feeds import collect_all_lewis_feeds
+from app.target_drift import compute_drift_signal
+from app.dispatch import dispatch_pending_decisions
+from app.risk_oracle_bridge import read_category_priors, bridge_status
 
 class TradingPlatform:
     def __init__(self, store_path: str = "data/state.json") -> None:
@@ -60,6 +65,30 @@ class TradingPlatform:
         # V5.7.1: Reset market data circuit breakers so each scan gets a fresh chance at the providers
         MarketDataService.reset_circuit_breakers()
         signals, _health = collect_live_signals(self.state, max_per_feed=max(5, max_signals // 4), enabled_feeds=enabled_feeds)
+
+        # === V6.0: Lewis-derived additions ===
+        # Pull in Fed-speech, on-chain whale, 13F-delta, filtered Form 4,
+        # STOCK Act, and activist-stake signals. Each collector degrades to
+        # [] on error so a single bad source can't break the scan.
+        try:
+            signals.extend(collect_all_lewis_feeds(self.state))
+        except Exception:
+            pass
+        # Portfolio target-allocation drift (Janet equivalent). One signal/scan.
+        try:
+            drift_sig = compute_drift_signal(self.state)
+            if drift_sig is not None:
+                signals.append(drift_sig)
+        except Exception:
+            pass
+        # Risk Oracle priors — populated for the UI and decision_engine to read.
+        try:
+            self.state["risk_oracle_priors"] = {
+                k: v.to_dict() for k, v in read_category_priors().items()
+            }
+        except Exception:
+            self.state["risk_oracle_priors"] = {}
+
         reliability = self.reliability.evaluate()
         signals_dicts = [s.to_dict() for s in signals]
         self.state["signals"] = signals_dicts
@@ -107,6 +136,20 @@ class TradingPlatform:
                 "failed": len([r for r in auto_results if not r.get("ok")]),
                 "details": auto_results,
             })
+
+        # 7b. V6.0: Email + Telegram dispatch for high-conviction decisions.
+        # Idempotent — already-dispatched decisions are skipped.
+        try:
+            dispatch_results = dispatch_pending_decisions(self.state)
+            if dispatch_results:
+                self.state.setdefault("journal", []).append({
+                    "ts": now_iso(),
+                    "event": "dispatch_pass",
+                    "sent": sum(1 for r in dispatch_results if r.get("email_sent") or r.get("telegram_sent")),
+                    "details": dispatch_results,
+                })
+        except Exception:
+            pass
 
         # 8. Flash alerts now operate on the fully-enriched alerts
         if self.state.get("settings", {}).get("flash_alerts_enabled", True):
@@ -196,6 +239,13 @@ class TradingPlatform:
         rep = self.reliability.evaluate().to_dict()
         self.save()
         return rep
+
+    # === V6.0 Risk Oracle bridge accessors ===
+    def risk_oracle_bridge_status(self) -> Dict[str, Any]:
+        return bridge_status()
+
+    def risk_oracle_priors(self) -> Dict[str, Any]:
+        return self.state.get("risk_oracle_priors", {}) or {}
 
     def signals_df(self) -> pd.DataFrame:
         cols = ["id", "created_at", "source", "symbol", "direction", "confidence", "magnitude", "title", "description", "horizon", "metadata"]

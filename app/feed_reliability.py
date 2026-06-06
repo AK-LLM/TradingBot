@@ -12,19 +12,20 @@ BLOCKING_STATUSES = {"error"}
 FEED_TYPE_FALLBACKS: Dict[str, List[str]] = {
     "prediction_market": ["polymarket", "kalshi", "predictit", "manifold"],
     "forecasting": ["metaculus"],
-    "news": ["news_rss"],
+    "news": ["news_rss", "short_reports"],
     "market_data": ["stooq_market"],
     "crypto_market_data": ["crypto_market", "binance_crypto"],
-    "filings": ["sec_filings"],
+    "filings": ["sec_filings", "sec_8k", "openinsider_cluster", "usaspending_contracts"],
     "positioning": ["cftc_cot"],
     "options": ["options_flow"],
-    "macro_data": ["fred_macro"],
+    "macro_data": ["fred_macro", "fred_leading", "treasury_liquidity", "credit_spreads", "ecb_macro", "boj_yen_carry"],
     "rates": ["treasury_rates"],
     "energy_data": ["eia_energy"],
     "weather": ["noaa_alerts"],
     "power_grid": ["grid_power"],
     "supply_chain": ["shipping_events"],
     "canada_macro": ["bank_of_canada"],
+    "attention": ["google_trends", "wikipedia_attention"],
 }
 
 @dataclass
@@ -70,6 +71,17 @@ def feed_key_from_health_name(feed_name: str) -> str:
         "power_grid_pulse": "grid_power",
         "shipping/supply_chain_events": "shipping_events",
         "bank_of_canada_macro": "bank_of_canada",
+        # V5.8 sniffer feed aliases
+        "fred_leading_indices": "fred_leading",
+        "treasury_liquidity_pulse": "treasury_liquidity",
+        "credit_spreads_pulse": "credit_spreads",
+        "ecb_statistical_data": "ecb_macro",
+        "yen_carry_trade_monitor": "boj_yen_carry",
+        "sec_8_k_material_events": "sec_8k",
+        "openinsider_cluster_buys": "openinsider_cluster",
+        "short_seller_reports": "short_reports",
+        "wikipedia_attention_anomaly": "wikipedia_attention",
+        "federal_contract_awards": "usaspending_contracts",
     }
     return aliases.get(normalized, normalized)
 

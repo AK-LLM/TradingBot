@@ -608,7 +608,7 @@ def render_settings_tab(p: TradingPlatform) -> None:
 
 
 def main():
-    st.set_page_config(page_title="Signal Trading Platform V5.7", layout="wide")
+    st.set_page_config(page_title="Signal Trading Platform V5.8", layout="wide")
     p = TradingPlatform()
     s = p.settings()
 
@@ -626,8 +626,8 @@ def main():
     flash_banner(p)
     stop_alert_banner(p)
 
-    st.title("🦈 Signal Trading Platform V5.7 — Decision Engine + Shark Radar Brain")
-    st.caption("🎯 Decision packages with auto-execute (paper) · 24 feeds (5 Canadian) · 11 constellation patterns · Velocity tracking · Auto-stops · Correlation/sector caps · VIX-adjusted sizing · Full action spectrum (ENTER/ADD/AVG_DOWN/PROFIT/REDUCE/EXIT)")
+    st.title("🦈 Signal Trading Platform V5.8 — Shark Radar Sniffer + Decision Engine")
+    st.caption("🦈 34 feeds (10 sniffer feeds for front-running) · Decision packages with auto-execute (paper) · 11 constellation patterns · Velocity tracking · Auto-stops · Correlation/sector caps · VIX-adjusted sizing · Full action spectrum")
 
     with st.sidebar:
         st.header("Controls")
@@ -852,7 +852,60 @@ def main():
         if health.empty:
             st.info("No feed health yet. Run a live Shark Scan.")
         else:
-            st.dataframe(health, width="stretch", hide_index=True)
+            # V5.8: Categorize feeds for clearer view
+            sniffer_names = {
+                "FRED Leading Indices", "Treasury Liquidity Pulse", "Credit Spreads Pulse",
+                "ECB Statistical Data", "Yen Carry Trade Monitor", "SEC 8-K Material Events",
+                "OpenInsider Cluster Buys", "Short Seller Reports",
+                "Wikipedia Attention Anomaly", "Federal Contract Awards",
+            }
+            ca_keywords = ["canada", "canadian", "sedi", "statcan", "bank of canada"]
+            crowd_names = {"Reddit Crowd Sentiment", "Google Trends Attention", "GDELT Global Events"}
+
+            health_copy = health.copy()
+            health_copy["category"] = health_copy["feed"].apply(
+                lambda f: "🦈 Sniffer" if f in sniffer_names
+                else "🇨🇦 Canadian" if any(k in f.lower() for k in ca_keywords)
+                else "📢 Crowd/Attention" if f in crowd_names
+                else "📊 Core"
+            )
+
+            # Summary row
+            live_count = (health_copy["status"] == "live").sum()
+            total = len(health_copy)
+            sniffer_live = ((health_copy["category"] == "🦈 Sniffer") & (health_copy["status"] == "live")).sum()
+            sniffer_total = (health_copy["category"] == "🦈 Sniffer").sum()
+            cols = st.columns(4)
+            cols[0].metric("Total Live", f"{live_count}/{total}")
+            cols[1].metric("🦈 Sniffer Live", f"{sniffer_live}/{sniffer_total}")
+            cols[2].metric("Core Live", f"{((health_copy['category']=='📊 Core') & (health_copy['status']=='live')).sum()}/{(health_copy['category']=='📊 Core').sum()}")
+            cols[3].metric("🇨🇦 Canadian Live", f"{((health_copy['category']=='🇨🇦 Canadian') & (health_copy['status']=='live')).sum()}/{(health_copy['category']=='🇨🇦 Canadian').sum()}")
+
+            # Filter
+            cats = sorted(health_copy["category"].unique())
+            cat_filter = st.multiselect("Filter by category", cats, default=cats)
+            filtered = health_copy[health_copy["category"].isin(cat_filter)]
+
+            st.dataframe(filtered.sort_values(["category", "status"]),
+                         width="stretch", hide_index=True)
+
+            with st.expander("ℹ️ About Sniffer Feeds (V5.8)"):
+                st.markdown("""
+**🦈 Sniffer Feeds** are designed for *front-running* — detecting themes/events BEFORE consensus forms:
+
+- **FRED Leading Indices** — Geopolitical Risk, Economic Policy Uncertainty, Financial Stress, Recession Probability
+- **Treasury Liquidity** — TGA balance + Reverse Repo levels (Fed liquidity early warning)
+- **Credit Spreads** — HY OAS + BBB spreads (risk-off leading indicator)
+- **ECB Statistical Data** — Composite Indicator of Systemic Stress (European stress)
+- **Yen Carry Trade Monitor** — USDJPY moves (global risk-on/off proxy)
+- **SEC 8-K Material Events** — M&A, bankruptcy, leadership changes before news
+- **OpenInsider Cluster Buys** — Multiple insiders buying same name within 30 days
+- **Short Seller Reports** — Hindenburg, Muddy Waters, Citron RSS
+- **Wikipedia Attention** — Pre-news pageview spikes for monitored entities
+- **Federal Contract Awards** — USASpending.gov $50M+ contracts to listed contractors
+
+All are free, no paid subscriptions. Some may be in fallback mode initially as services adjust to Streamlit Cloud IPs.
+                """)
 
     with tabs[12]:
         st.subheader("Orders")
