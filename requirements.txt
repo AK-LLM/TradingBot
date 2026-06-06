@@ -7,6 +7,13 @@ ib_insync>=0.9.86
 pytrends>=4.9.0  # optional for richer Google Trends signal
 # V6.1: TA matrix module needs pandas-ta + yfinance. Both are soft deps —
 # if absent, the ta_matrix collector returns [] gracefully.
-pandas-ta>=0.3.14b0
+#
+# IMPORTANT — pandas-ta is pinned to 0.3.14b0 deliberately. From 0.4.x
+# onward, pandas-ta requires `numba`, which requires `llvmlite`, which does
+# not yet build on Python 3.14 (Streamlit Cloud's current runtime). Pinning
+# to 0.3.14b0 keeps pandas-ta pure-Python and installable everywhere.
+# All indicators ta_matrix.py uses (ema, rsi, stoch, macd, cci, mfi, adx,
+# bbands, willr, roc, atr, obv, supertrend, mom, sma) exist in 0.3.x.
+pandas-ta==0.3.14b0
 yfinance>=0.2.40
 
